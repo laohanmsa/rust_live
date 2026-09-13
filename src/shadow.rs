@@ -36,6 +36,7 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub django_url: String,
+    pub history_url: String,
     pub nats_url: String,
     pub redis_url: String,
     pub bind: String,
@@ -87,6 +88,7 @@ struct Data {
     decisions: VecDeque<Value>,
     restore: Vec<(String, u64)>,
     clocks: BTreeMap<String, u64>,
+    history_error: String,
 }
 struct App {
     settings: Settings,
@@ -104,6 +106,21 @@ struct App {
     http: reqwest::Client,
 }
 impl App {
+    async fn history_loop(self: Arc<Self>) {
+        loop {
+            let result = crate::shadow_history::export_once(
+                &self.http,
+                &self.settings.history_url,
+                &self.journal,
+            )
+            .await;
+            self.data.write().await.history_error = match result {
+                Ok(_) => String::new(),
+                Err(_) => "history_export_failed_retrying".into(),
+            };
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
     fn ready(&self, data: &Data) -> bool {
         !self.stopped.load(Ordering::SeqCst)
             && self.nats_up.load(Ordering::SeqCst)
@@ -536,6 +553,7 @@ impl App {
             r.state = "blocked".into();
             r.reason = "state_changed_or_expired_before_submit".into();
         } else {
+            r.submitted_at_ms = Some(now_ms());
             r.dispatch_ms = Some(elapsed_ms(received));
             if local_clock {
                 r.source_to_dispatch_ms = Some(now_ms().saturating_sub(source_ms) as f64);
@@ -601,6 +619,10 @@ async fn metrics(
     result["boot_at_ms"] = json!(app.boot_at_ms);
     result["mode"] = json!("shadow");
     result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"with_valuation":data.markets.values().filter(|c|c.valuation.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
+    let history_error = data.history_error.clone();
+    drop(data);
+    let ledger = app.journal.lock().await;
+    result["history"] = json!({"exported":ledger.exported.len(),"pending":ledger.orders.values().filter(|o|matches!(o.reply.state.as_str(), "accepted" | "unknown")&&!ledger.exported.contains(&o.signal.id)).count(),"error":history_error});
     (StatusCode::OK, Json(result))
 }
 async fn markets(State(app): State<Arc<App>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -661,12 +683,14 @@ pub async fn serve(settings: Settings) -> Result<()> {
         http: reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
     });
     let tasks = [
         tokio::spawn(app.clone().redis_loop()),
         tokio::spawn(app.clone().nats_loop()),
         tokio::spawn(app.clone().sync_loop()),
+        tokio::spawn(app.clone().history_loop()),
     ];
     let router = Router::new()
         .route("/health", get(health))

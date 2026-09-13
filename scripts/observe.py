@@ -114,6 +114,8 @@ def render(data):
     print(f"Journal: {r['journal_bytes']} bytes | restarts: {data['restarts']} | network/disk are cumulative container counters")
     print(f"Since boot: received={m['received']}, completed={m['completed']}, replayed={m['replayed']}; queue={m['queued']}, active={m['active']}")
     print(f"Observation window: {m['window_seconds']}s; retained={m['window_samples']}/{m['sample_capacity']}; truncated={m['window_truncated']}")
+    if m.get('history'):
+        print('Dashboard dry-run history: '+json.dumps(m['history']))
     if m.get('sources'):
         sources=dict(m['sources']);sources.pop('recent_mock_orders',None)
         print('Real-data sources: '+json.dumps(sources))

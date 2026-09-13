@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::Path,
@@ -27,8 +27,10 @@ enum Record {
 }
 pub struct Journal {
     file: File,
+    history_file: File,
     pub orders: HashMap<String, Stored>,
     pub used: Decimal,
+    pub exported: HashSet<String>,
     failed: bool,
 }
 impl Journal {
@@ -111,10 +113,30 @@ impl Journal {
                 File::open(p)?.sync_all()?;
             }
         }
+        // Keep acknowledgement records separate so the previous binary can roll back safely.
+        let history_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .mode(0o600)
+            .open(path.with_extension("history-acks.jsonl"))?;
+        let mut exported = HashSet::new();
+        for line in BufReader::new(&history_file).lines() {
+            if let Ok(id) = serde_json::from_str::<String>(&line?) {
+                ensure!(
+                    orders.contains_key(&id),
+                    "history acknowledgement without order"
+                );
+                exported.insert(id);
+            }
+            // A torn acknowledgement is retried using the server's unique signal ID.
+        }
         Ok(Self {
             file,
+            history_file,
             orders,
             used,
+            exported,
             failed: false,
         })
     }
@@ -156,6 +178,17 @@ impl Journal {
             .get_mut(&reply.id)
             .context("missing prepared order")?;
         stored.reply = reply;
+        Ok(())
+    }
+    pub fn ack_history(&mut self, id: &str) -> Result<()> {
+        ensure!(self.orders.contains_key(id), "missing history order");
+        if !self.exported.contains(id) {
+            let mut record = serde_json::to_vec(id)?;
+            record.push(b'\n');
+            self.history_file.write_all(&record)?;
+            self.history_file.sync_all()?;
+            self.exported.insert(id.into());
+        }
         Ok(())
     }
 }

@@ -2,6 +2,7 @@ pub mod demo;
 pub mod exchange;
 pub mod journal;
 pub mod shadow;
+pub mod shadow_history;
 pub mod shadow_state;
 pub mod telemetry;
 
@@ -125,6 +126,8 @@ pub struct Signal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
     #[serde(default)]
+    pub submitted_at_ms: Option<u64>,
+    #[serde(default)]
     pub replayed: bool,
     pub policy_ms: Option<f64>,
     pub post_ms: Option<f64>,
@@ -145,6 +148,7 @@ pub struct Reply {
 impl Reply {
     fn blocked(id: &str, reason: &str) -> Self {
         Self {
+            submitted_at_ms: None,
             replayed: false,
             policy_ms: None,
             post_ms: None,
