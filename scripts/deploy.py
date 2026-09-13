@@ -83,7 +83,7 @@ def main():
     if not re.fullmatch(r'[a-f0-9]{40}',sha) or not branch: raise RuntimeError('build from an identified Git branch')
     if run(['git','-C',str(ROOT),'status','--porcelain'],capture=True).strip(): raise RuntimeError('commit changes first; deployment only archives a clean commit')
     image=f'{REPOSITORY}:{sha[:12]}'
-    log(f'branch={branch} revision={sha} | build=brahma | runtime=amster-p | mode=demo')
+    log(f'branch={branch} revision={sha} | build=brahma | runtime=amster-p | mode=shadow')
     log(f'image={image} | project=polym-rust-demo | limits=0.5 CPU core / 256 MiB')
     if args.dry_run: return
     creds=credentials(args.registry_env)
@@ -142,7 +142,20 @@ verify() {
  compose up -d --no-deps --pull never --wait --wait-timeout 120 trader || return 1
  cid=$(compose ps -q trader)
  test "$(sudo -n docker inspect "$cid" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" || return 1
- python3 -c 'import json,urllib.request; d=json.load(urllib.request.urlopen("http://127.0.0.1:18787/health",timeout=5)); assert d["mode"]=="demo" and d["ready"],d' || return 1
+ python3 - <<'READY' || return 1
+import json,time,urllib.request
+for _ in range(90):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:18787/health",timeout=5) as response:
+            state=json.load(response)
+        if state.get("mode")=="shadow" and state.get("ready"):
+            break
+    except OSError:
+        pass
+    time.sleep(1)
+else:
+    raise SystemExit("shadow input/context readiness timed out")
+READY
 }
 if ! verify; then
  echo 'ERROR new demo deployment failed verification' >&2

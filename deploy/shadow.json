@@ -1,0 +1,12 @@
+{
+  "django_url": "http://web:8000/api/trading-context/",
+  "nats_url": "nats://nats:4222",
+  "redis_url": "redis://redis:6379/0",
+  "bind": "0.0.0.0:8787",
+  "journal": "/app/data/shadow-orders.jsonl",
+  "max_signal_age_ms": 200,
+  "max_inflight": 8,
+  "context_max_age_ms": 90000,
+  "max_order_budget_pusd": "10.00",
+  "total_budget_pusd": "10000.00"
+}

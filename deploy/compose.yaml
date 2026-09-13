@@ -2,7 +2,8 @@ name: polym-rust-demo
 services:
   trader:
     image: ${DEMO_IMAGE:?set immutable DEMO_IMAGE digest}
-    command: ["serve", "/app/config.json"]
+    command: ["shadow", "/app/shadow.json"]
+    networks: [default, polym-data]
     environment:
       DEMO_BIND: 0.0.0.0:8787
       TOKIO_WORKER_THREADS: "2"
@@ -34,3 +35,8 @@ services:
         max-file: "2"
 volumes:
   order-data:
+
+networks:
+  polym-data:
+    external: true
+    name: polym_amster_polym

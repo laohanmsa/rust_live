@@ -65,6 +65,50 @@ impl Exchange {
         )
         .await
     }
+    pub async fn shadow(host: &str) -> Result<Self> {
+        let mut exchange = Self::demo(host).await?;
+        exchange.mode = "shadow";
+        ensure!(
+            exchange.client.version().await? == 2,
+            "shadow mock must use V2"
+        );
+        Ok(exchange)
+    }
+    pub async fn sign_shadow(
+        &self,
+        signal: &Signal,
+        shares: Decimal,
+        tick: Decimal,
+        neg_risk: bool,
+    ) -> Result<Signed> {
+        ensure!(
+            self.mode == "shadow",
+            "shadow signing requires mock-only exchange"
+        );
+        self.client.set_tick_size(signal.token_id, tick.try_into()?);
+        self.client.set_neg_risk(signal.token_id, neg_risk);
+        let order = self
+            .client
+            .limit_order()
+            .token_id(signal.token_id)
+            .side(Side::Buy)
+            .order_type(OrderType::FAK)
+            .price(signal.ask)
+            .size(shares)
+            .build()
+            .await?;
+        let OrderPayload::V2(payload) = &order.payload else {
+            anyhow::bail!("unexpected protocol")
+        };
+        let domain = eip712_domain! {name:"Polymarket CTF Exchange",version:"2",chain_id:POLYGON,verifying_contract:contract_config(POLYGON,neg_risk).and_then(|c|c.exchange_v2).context("missing exchange contract")?,};
+        let hash = payload.order.eip712_signing_hash(&domain).to_string();
+        let signed = self.client.sign(&self.signer, order).await?;
+        Ok(Signed {
+            wire: serde_json::to_vec(&signed)?,
+            journal_order: serde_json::to_value(&signed)?["order"].clone(),
+            hash,
+        })
+    }
     pub async fn live() -> Result<Self> {
         fn env(k: &str) -> Result<String> {
             std::env::var(k).with_context(|| format!("missing {k}"))

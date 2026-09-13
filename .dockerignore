@@ -4,3 +4,5 @@
 !src/**
 !tests/**
 !deploy/config.json
+
+!deploy/shadow.json

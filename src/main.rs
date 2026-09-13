@@ -9,6 +9,14 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("demo") {
         "demo" => run_demo(args.get(1).map(|x| x.parse()).transpose()?.unwrap_or(1)).await,
+        "shadow" => {
+            polym_rust_demo::shadow::serve(polym_rust_demo::shadow::Settings::read(Path::new(
+                args.get(1)
+                    .map(String::as_str)
+                    .unwrap_or("deploy/shadow.json"),
+            ))?)
+            .await
+        }
         "serve" => {
             let live = args.iter().any(|x| x == "--live");
             ensure!(args.len() <= 3, "usage: serve [config.json] [--live]");

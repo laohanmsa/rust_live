@@ -127,13 +127,17 @@ fn verify(headers: &HeaderMap, bytes: &[u8]) -> Result<String> {
         order.makerAmount > U256::ZERO && order.takerAmount > U256::ZERO,
         "empty order"
     );
-    let domain = eip712_domain! {name:"Polymarket CTF Exchange",version:"2",chain_id:POLYGON,verifying_contract:contract_config(POLYGON,false).unwrap().exchange_v2.unwrap(),};
-    let hash = order.eip712_signing_hash(&domain);
     let sig: Signature = o["signature"].as_str().unwrap_or("").parse()?;
-    ensure!(
-        sig.recover_address_from_prehash(&hash)? == order.signer,
-        "bad EIP-712 signature"
-    );
+    let mut verified = None;
+    for neg_risk in [false, true] {
+        let domain = eip712_domain! {name:"Polymarket CTF Exchange",version:"2",chain_id:POLYGON,verifying_contract:contract_config(POLYGON,neg_risk).unwrap().exchange_v2.unwrap(),};
+        let hash = order.eip712_signing_hash(&domain);
+        if sig.recover_address_from_prehash(&hash)? == order.signer {
+            verified = Some(hash);
+            break;
+        }
+    }
+    let hash = verified.ok_or_else(|| anyhow::anyhow!("bad EIP-712 signature"))?;
     ensure!(
         header(headers, "POLY_ADDRESS")?.parse::<alloy::primitives::Address>()? == order.signer,
         "wrong signer header"

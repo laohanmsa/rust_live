@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY --from=build /binary /usr/local/bin/polym-rust-demo
 COPY deploy/config.json /app/config.json
+COPY deploy/shadow.json /app/shadow.json
 USER 10001:10001
 ENTRYPOINT ["polym-rust-demo"]
 CMD ["serve", "/app/config.json"]
