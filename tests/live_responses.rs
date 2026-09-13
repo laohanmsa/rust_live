@@ -46,3 +46,32 @@ fn live_acknowledgements_preserve_uncertainty_and_do_not_invent_fills() {
     apply_exchange_response(&mut r, 503, &json!({}));
     assert_eq!(r.state, "unknown");
 }
+
+#[test]
+fn no_match_classification_requires_matching_hash_and_uncontradicted_evidence() {
+    let no_match = json!({"orderID":"0xabc","errorMsg":"no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."});
+    for status in [200, 400, 422] {
+        let mut r = reply();
+        apply_exchange_response(&mut r, status, &no_match);
+        assert_eq!(r.state, "rejected");
+    }
+    for (status, update) in [
+        (503, json!({})),
+        (400, json!({"orderID":"0xwrong"})),
+        (400, json!({"success":true})),
+        (200, json!({"success":true,"status":"matched"})),
+        (400, json!({"takingAmount":"5"})),
+        (400, json!({"makingAmount":"4.95"})),
+        (400, json!({"tradeIDs":["trade"]})),
+        (400, json!({"transactionsHashes":["0xtransaction"]})),
+        (400, json!({"errorMsg":"upstream internal error"})),
+    ] {
+        let mut r = reply();
+        let mut body = no_match.clone();
+        body.as_object_mut()
+            .unwrap()
+            .extend(update.as_object().unwrap().clone());
+        apply_exchange_response(&mut r, status, &body);
+        assert_eq!(r.state, "unknown", "status={status} body={body}");
+    }
+}

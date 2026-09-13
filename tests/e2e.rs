@@ -54,6 +54,35 @@ fn directory() -> PathBuf {
 }
 
 #[tokio::test]
+async fn explicit_fak_no_match_with_order_hash_does_not_pause_new_orders() -> anyhow::Result<()> {
+    let mock = demo::MockExchange::start().await?;
+    let dir = directory();
+    let app = Fixture::start(
+        demo::config(dir.join("orders.jsonl").to_string_lossy().into()),
+        &mock,
+    )
+    .await?;
+    mock.state.response_code.store(400, Ordering::SeqCst);
+    let rejected = app.send(&demo::signal("no-match")).await?;
+    assert_eq!(rejected["state"], "rejected", "{rejected}");
+    assert!(
+        rejected["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("exchange_no_match")
+    );
+    mock.state.response_code.store(0, Ordering::SeqCst);
+    assert_eq!(
+        app.send(&demo::signal("next-fresh-signal")).await?["state"],
+        "accepted"
+    );
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 2);
+    app.close().await?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn http_signature_deduplication_policy_budget_and_restart() -> anyhow::Result<()> {
     let mock = demo::MockExchange::start().await?;
     let dir = directory();

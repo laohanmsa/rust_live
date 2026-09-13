@@ -207,14 +207,41 @@ pub fn apply_exchange_response(reply: &mut Reply, status: u16, body: &Value) {
     {
         response["errorMsg"] = json!(error);
     }
+    // CLOB can return a definite FAK no-fill together with the submitted order hash.
+    let no_match = error.as_deref().is_some_and(|e| {
+        e.to_ascii_lowercase()
+            .starts_with("no orders found to match with fak order.")
+    }) && reply.order_hash.is_some()
+        && body["orderID"].as_str() == reply.order_hash.as_deref()
+        && body["success"] != true
+        && exchange_status.is_empty()
+        && ["makingAmount", "takingAmount"].iter().all(|k| {
+            body.get(k).is_none_or(|v| {
+                v.is_null()
+                    || v.as_str().is_some_and(|s| {
+                        s.is_empty() || s.parse::<Decimal>().is_ok_and(|n| n == Decimal::ZERO)
+                    })
+            })
+        })
+        && ["tradeIDs", "transactionsHashes"].iter().all(|k| {
+            body.get(k)
+                .is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+        });
     if (200..300).contains(&status)
         && body["success"] == true
+        && error.as_deref().is_none_or(str::is_empty)
         && body["orderID"].as_str() == reply.order_hash.as_deref()
         && ["matched", "delayed", "live", "unmatched"].contains(&exchange_status.as_str())
     {
         reply.state = "accepted".into();
         reply.reason.clear();
         reply.exchange_status = Some(exchange_status);
+    } else if [200, 400, 422].contains(&status) && no_match {
+        reply.state = "rejected".into();
+        reply.reason = format!(
+            "exchange_no_match: {}",
+            error.as_deref().unwrap_or_default()
+        );
     } else if ([400, 401, 403, 404, 422, 429].contains(&status)
         && body["success"] != true
         && body["orderID"].as_str().is_none_or(str::is_empty))

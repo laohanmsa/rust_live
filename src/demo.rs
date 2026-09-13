@@ -164,6 +164,14 @@ async fn order(
             ))
             .await;
             if s.response_code.load(Ordering::SeqCst) != 0 {
+                if s.response_code.load(Ordering::SeqCst) == 400 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!({"orderID":hash,"errorMsg":"no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."}),
+                        ),
+                    );
+                }
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(json!({"error":"rate_limited"})),
