@@ -6,3 +6,5 @@
 !deploy/config.json
 
 !deploy/shadow.json
+
+!deploy/live.json
