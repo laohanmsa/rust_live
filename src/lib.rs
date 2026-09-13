@@ -198,7 +198,9 @@ pub fn apply_exchange_response(reply: &mut Reply, status: u16, body: &Value) {
         reply.state = "accepted".into();
         reply.reason.clear();
         reply.exchange_status = Some(exchange_status);
-    } else if [400, 401, 403, 404, 422, 429].contains(&status)
+    } else if ([400, 401, 403, 404, 422, 429].contains(&status)
+        && body["success"] != true
+        && body["orderID"].as_str().is_none_or(str::is_empty))
         || ((200..300).contains(&status)
             && body["success"] == false
             && body["orderID"].as_str().is_none_or(str::is_empty))

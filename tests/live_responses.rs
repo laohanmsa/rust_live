@@ -27,6 +27,12 @@ fn live_acknowledgements_preserve_uncertainty_and_do_not_invent_fills() {
         &json!({"success":true,"orderID":"0xwrong","status":"matched"}),
     );
     assert_eq!(r.state, "unknown");
+    apply_exchange_response(
+        &mut r,
+        400,
+        &json!({"success":true,"orderID":"0xabc","status":"matched"}),
+    );
+    assert_eq!(r.state, "unknown");
     apply_exchange_response(&mut r, 503, &json!({}));
     assert_eq!(r.state, "unknown");
 }
