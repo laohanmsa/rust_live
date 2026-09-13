@@ -117,7 +117,7 @@ def render(data):
     if m.get('history'):
         print('Dashboard dry-run history: '+json.dumps(m['history']))
     if m.get('sources'):
-        sources=dict(m['sources']);sources.pop('recent_mock_orders',None)
+        sources=dict(m['sources']);sources.pop('recent_mock_orders',None);sources.pop('recent_rejections',None)
         print('Real-data sources: '+json.dumps(sources))
     print('Response states (including replays): '+json.dumps(m['states'])+' | Reasons: '+json.dumps(m['reasons']))
     print(f"{'Stage (milliseconds)':26} {'n':>5} {'p50':>10} {'p95':>10} {'p99':>10} {'max':>10}")

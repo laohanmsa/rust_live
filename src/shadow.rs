@@ -37,6 +37,7 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 pub struct Settings {
     pub django_url: String,
     pub history_url: String,
+    pub ober_url: String,
     pub nats_url: String,
     pub redis_url: String,
     pub bind: String,
@@ -89,6 +90,7 @@ struct Data {
     restore: Vec<(String, u64)>,
     clocks: BTreeMap<String, u64>,
     history_error: String,
+    rejections: VecDeque<Value>,
 }
 struct App {
     settings: Settings,
@@ -211,14 +213,13 @@ impl App {
                                                 && now_ms().saturating_sub(m.received_ms) < 30_000
                                         },
                                     )
-                                    && (context.valuation.is_none()
-                                        || context.resolution.as_ref().is_none_or(|r| {
-                                            !data.lifecycle.is_proposed(
-                                                &context.market_id,
-                                                r.request_id.as_deref().unwrap_or(""),
-                                                r.block_number.unwrap_or(0),
-                                            )
-                                        }));
+                                    && context.resolution.as_ref().is_none_or(|r| {
+                                        !data.lifecycle.is_proposed(
+                                            &context.market_id,
+                                            r.request_id.as_deref().unwrap_or(""),
+                                            r.block_number.unwrap_or(0),
+                                        )
+                                    });
                             if !waiting {
                                 data.lifecycle.needs_refresh.remove(&context.market_id);
                             }
@@ -332,20 +333,37 @@ impl App {
             {
                 self.nats_up.store(true, Ordering::SeqCst);
                 while let Some(message) = sub.next().await {
-                    self.receive(&message.payload).await;
+                    self.telemetry.received();
+                    let received = Instant::now();
+                    match self.slots.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let app = self.clone();
+                            tokio::spawn(async move {
+                                app.receive(&message.payload, permit, received).await;
+                            });
+                        }
+                        Err(_) => self.telemetry.finished(
+                            &Reply::blocked("", "inflight_limit"),
+                            0.0,
+                            false,
+                        ),
+                    }
                 }
             }
             self.nats_up.store(false, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-    async fn receive(self: &Arc<Self>, payload: &[u8]) {
-        let received = Instant::now();
-        self.telemetry.received();
+    async fn receive(
+        self: &Arc<Self>,
+        payload: &[u8],
+        permit: tokio::sync::OwnedSemaphorePermit,
+        received: Instant,
+    ) {
         let id = format!("shadow-{:x}", Sha256::digest(payload));
         let book = serde_json::from_slice::<Value>(payload);
         let mut reply = Reply::blocked(&id, "");
-        let book = match book {
+        let mut book = match book {
             Ok(book) if payload.len() <= 1048576 => book,
             _ => {
                 reply.reason = "invalid_ober_payload".into();
@@ -362,19 +380,10 @@ impl App {
             self.telemetry.finished(&reply, elapsed_ms(received), false);
             return;
         }
-        let permit = match self.slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                reply.state = "busy".into();
-                reply.reason = "inflight_limit".into();
-                self.telemetry.finished(&reply, elapsed_ms(received), false);
-                return;
-            }
-        };
         let local_clock = book["timestamp"]
             .as_u64()
             .is_some_and(|t| t >= 100_000_000_000_000);
-        let decision = {
+        {
             let mut data = self.data.write().await;
             data.last_ober_ms = now_ms();
             *data
@@ -388,6 +397,33 @@ impl App {
                     .into(),
                 )
                 .or_default() += 1;
+        }
+        if book["best_ask"].is_null() {
+            reply.reason = "missing_ask".into();
+            self.telemetry.finished(&reply, elapsed_ms(received), false);
+            return;
+        }
+        let remaining = self
+            .settings
+            .max_signal_age_ms
+            .saturating_sub(now_ms().saturating_sub(timestamp.unwrap_or(0)));
+        let preparation = tokio::time::timeout(
+            Duration::from_millis(remaining),
+            self.prepare_inputs(&mut book),
+        )
+        .await;
+        if !matches!(preparation, Ok(Ok(()))) {
+            let reason = match preparation {
+                Ok(Err(reason)) => reason,
+                _ => "input_preparation_expired",
+            };
+            reply.reason = reason.into();
+            self.remember_rejection(&book, reason).await;
+            self.telemetry.finished(&reply, elapsed_ms(received), false);
+            return;
+        }
+        let decision = {
+            let mut data = self.data.write().await;
             let market = book["market_id"].as_str().map(str::to_owned).or_else(|| {
                 data.tokens
                     .get(book["token_id"].as_str().unwrap_or(""))
@@ -441,10 +477,124 @@ impl App {
                 });
             }
             Err(reason) => {
+                self.remember_rejection(&book, reason).await;
                 reply.reason = reason.into();
                 self.telemetry.finished(&reply, elapsed_ms(received), false);
             }
         }
+    }
+    async fn prepare_inputs(&self, book: &mut Value) -> Result<(), &'static str> {
+        let market = book["market_id"]
+            .as_str()
+            .ok_or("missing_market_id")?
+            .to_owned();
+        let needs_fetch = {
+            let data = self.data.read().await;
+            if !self.ready(&data) {
+                return Err("context_not_ready");
+            }
+            if data
+                .lifecycle
+                .marks
+                .get(&market)
+                .is_some_and(|m| m.status != "proposed")
+                || data.lifecycle.has_dispute(&market)
+            {
+                return Err("not_proposed_or_lifecycle_changed");
+            }
+            data.markets.get(&market).is_none_or(|c| {
+                c.resolution.as_ref().is_none_or(|r| {
+                    !data.lifecycle.matches_proposal(
+                        &market,
+                        r.request_id.as_deref().unwrap_or(""),
+                        r.block_number.unwrap_or(0),
+                        r.proposed_price,
+                    )
+                })
+            })
+        };
+        if needs_fetch {
+            let (rows, policy) = self
+                .fetch(Some(std::slice::from_ref(&market)))
+                .await
+                .map_err(|_| "context_fetch_failed")?;
+            let mut data = self.data.write().await;
+            for context in rows {
+                data.lifecycle
+                    .reconcile_settles(&context.market_id, &context.settled_request_blocks);
+                if let Some(r) = &context.resolution {
+                    data.lifecycle.seed(&context.market_id, r);
+                }
+                data.markets
+                    .insert(context.market_id.clone(), Arc::new(context));
+            }
+            if policy.is_some() {
+                data.policy = policy;
+            }
+        }
+        let loser = {
+            let data = self.data.read().await;
+            let c = data.markets.get(&market).ok_or("market_not_eligible")?;
+            let r = c.resolution.as_ref().ok_or("missing_resolution")?;
+            if !c.eligible
+                || !data.lifecycle.matches_proposal(
+                    &market,
+                    r.request_id.as_deref().unwrap_or(""),
+                    r.block_number.unwrap_or(0),
+                    r.proposed_price,
+                )
+                || data.lifecycle.has_dispute(&market)
+            {
+                return Err("not_proposed_or_lifecycle_changed");
+            }
+            let (winner, loser) = if r.proposed_price == Decimal::ONE {
+                (&c.token_id_yes, &c.token_id_no)
+            } else if r.proposed_price == Decimal::ZERO {
+                (&c.token_id_no, &c.token_id_yes)
+            } else {
+                return Err("non_binary_proposal");
+            };
+            if winner.as_deref() != book["token_id"].as_str() {
+                return Err("not_winner_token");
+            }
+            loser.clone().ok_or("missing_loser_token")?
+        };
+        // Existing OBer in-memory best endpoint rejects quarantined/unsynchronized books.
+        let quote: Value = self
+            .http
+            .get(format!(
+                "{}/book/{}/best",
+                self.settings.ober_url.trim_end_matches('/'),
+                loser
+            ))
+            .send()
+            .await
+            .map_err(|_| "loser_book_unavailable")?
+            .error_for_status()
+            .map_err(|_| "loser_book_unavailable")?
+            .json()
+            .await
+            .map_err(|_| "invalid_loser_book")?;
+        if quote["token_id"].as_str() != Some(loser.as_str()) {
+            return Err("loser_token_mismatch");
+        }
+        book["loser_bid"] = if quote["best_bid"].is_null() {
+            json!(0)
+        } else {
+            quote["best_bid"].clone()
+        };
+        Ok(())
+    }
+    async fn remember_rejection(&self, book: &Value, reason: &str) {
+        let mut data = self.data.write().await;
+        let market = book["market_id"].as_str().unwrap_or("");
+        let sample = json!({"at_ms":now_ms(),"market_id":market,"reason":reason,"ask":book["best_ask"],
+            "context_status":data.markets.get(market).and_then(|c|c.resolution.as_ref()).map(|r|&r.status),
+            "lifecycle_status":data.lifecycle.marks.get(market).map(|m|&m.status)});
+        if data.rejections.len() == 32 {
+            data.rejections.pop_front();
+        }
+        data.rejections.push_back(sample);
     }
     async fn remember(&self, reply: &Reply) {
         let mut data = self.data.write().await;
@@ -493,7 +643,7 @@ impl App {
             .sign_shadow(
                 &signal,
                 decision.shares,
-                decision.context.min_tick_size,
+                decision.tick,
                 decision.context.neg_risk,
             )
             .await
@@ -618,7 +768,8 @@ async fn metrics(
     result["queued"] = json!(0);
     result["boot_at_ms"] = json!(app.boot_at_ms);
     result["mode"] = json!("shadow");
-    result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"with_valuation":data.markets.values().filter(|c|c.valuation.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
+    result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"valuation_mode":"local_m5","valuation_inputs":data.markets.values().filter(|c|c.market_volume.is_some()&&c.event_volume.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
+    result["sources"]["recent_rejections"] = json!(data.rejections);
     let history_error = data.history_error.clone();
     drop(data);
     let ledger = app.journal.lock().await;
@@ -722,4 +873,134 @@ pub async fn serve(settings: Settings) -> Result<()> {
     let _permits = app.slots.acquire_many(max as u32).await?;
     drop(mock);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn first_signal_with_no_cached_valuation_submits_independently_of_live_quota()
+    -> Result<()> {
+        let now = now_ms();
+        let page = json!({"schema_version":1,"captured_at_ms":now,"has_more":false,"next_after_id":null,
+            "config":{"valuation_key":"m5_expected_payout","manual_trade_shutdown_enabled":false,"strategy_enabled":true,
+                "max_ask_price":"0.999","max_orders_per_market":1,"ev_threshold":"0.0002","order_size_usd":"5",
+                "low_price_order_size_usd":"10","low_depth_099_order_size_usd":"10"},
+            "results":[{"market_id":"test-market","question":"Synthetic market","market_volume":"0","event_volume":"0",
+                "tags":["Sports"],"eligible":true,"token_id_yes":"42","token_id_no":"43","active":true,"closed":false,
+                "accepting_orders":true,"auto_archived":false,"min_tick_size":"0.01","min_order_size":"5","neg_risk":false,
+                "fees_enabled":false,"fee_schedule":null,"fee_verification_status":"unverified","has_disputed_resolution":false,
+                "existing_order_count":1,"valuation":null,
+                "resolution":{"id":1,"request_id":"r","status":"proposed","proposed_price":"1","propose_time_ms":now,
+                    "block_number":10,"dispute_block_number":null,"settle_block_number":null,"disputed":false,"settled":false}}]});
+        let router = Router::new()
+            .route(
+                "/context",
+                get(move || {
+                    let page = page.clone();
+                    async move { Json(page) }
+                }),
+            )
+            .route(
+                "/book/43/best",
+                get(|| async { Json(json!({"token_id":"43","best_bid":"0.10"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let mock = demo::MockExchange::start().await?;
+        let exchange = Exchange::shadow(&mock.url).await?;
+        let path =
+            std::env::temp_dir().join(format!("shadow-parity-{}-{now}.jsonl", std::process::id()));
+        let journal = Journal::open(&path, &exchange.scope())?;
+        let app = Arc::new(App {
+            settings: Settings {
+                django_url: format!("{url}/context"),
+                history_url: format!("{url}/history"),
+                ober_url: url,
+                nats_url: String::new(),
+                redis_url: String::new(),
+                bind: String::new(),
+                journal: path.to_string_lossy().into(),
+                max_signal_age_ms: 5000,
+                max_inflight: 8,
+                context_max_age_ms: 90000,
+                max_order_budget_pusd: "10".parse()?,
+                total_budget_pusd: "100".parse()?,
+            },
+            data: RwLock::new(Data {
+                last_sync_ms: now,
+                synced_epoch: Some(1),
+                ..Data::default()
+            }),
+            telemetry: Telemetry::default(),
+            exchange,
+            journal: Arc::new(Mutex::new(journal)),
+            slots: Arc::new(Semaphore::new(8)),
+            notify: Notify::new(),
+            nats_up: AtomicBool::new(true),
+            redis_up: AtomicBool::new(true),
+            redis_epoch: AtomicU64::new(1),
+            stopped: AtomicBool::new(false),
+            boot_at_ms: now,
+            http: reqwest::Client::new(),
+        });
+        let mut book = json!({"market_id":"test-market","token_id":"42","timestamp":now_ms()*1000,
+            "best_ask":{"price":"0.90","size":"20"},"best_bid":{"price":"0.82","size":"100"},"tick_size":"0.001",
+            "top_5_asks":[{"price":"0.90","size":"20"}],"top_5_bids":[{"price":"0.82","size":"100"}]});
+        app.receive(
+            &serde_json::to_vec(&book)?,
+            app.slots.clone().acquire_owned().await?,
+            Instant::now(),
+        )
+        .await;
+        let permits = app.slots.acquire_many(8).await?;
+        assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.journal
+                .lock()
+                .await
+                .orders
+                .values()
+                .next()
+                .unwrap()
+                .reply
+                .state,
+            "accepted"
+        );
+        drop(permits);
+        book["timestamp"] = json!(now_ms() * 1000);
+        app.receive(
+            &serde_json::to_vec(&book)?,
+            app.slots.clone().acquire_owned().await?,
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.data.read().await.rejections.back().unwrap()["reason"],
+            "max_orders_per_market"
+        );
+        app.data.write().await.lifecycle.apply(
+            "uma:dispute_price",
+            &json!({"market_id":"test-market","request_id":"r","block_number":11}),
+        );
+        app.receive(
+            &serde_json::to_vec(&book)?,
+            app.slots.clone().acquire_owned().await?,
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.data.read().await.rejections.back().unwrap()["reason"],
+            "not_proposed_or_lifecycle_changed"
+        );
+        server.abort();
+        drop(app);
+        std::fs::remove_file(path.with_extension("history-acks.jsonl"))?;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 }

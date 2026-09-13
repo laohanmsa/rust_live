@@ -1,5 +1,6 @@
 {
   "django_url": "http://web:8000/api/trading-context/",
+  "ober_url": "http://ober:8080",
   "history_url": "http://web:8000/api/shadow-orders/",
   "nats_url": "nats://nats:4222",
   "redis_url": "redis://redis:6379/0",

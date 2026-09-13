@@ -4,6 +4,7 @@ pub mod journal;
 pub mod shadow;
 pub mod shadow_history;
 pub mod shadow_state;
+pub mod shadow_valuation;
 pub mod telemetry;
 
 use anyhow::{Result, ensure};

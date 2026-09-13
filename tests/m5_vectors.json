@@ -1,0 +1,275 @@
+[
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "0.0000",
+      "winner_bid": "0.820000",
+      "winner_ask": "0.900000",
+      "winner_bid_depth": "1741.03",
+      "loser_bid": "0.100000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999980672641931641918715538"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.120000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "4802.81",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 4
+    },
+    "expected": "0.9999984591875116997938230768"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "0.0000",
+      "winner_bid": "0.120000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "4877.03",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 1
+    },
+    "expected": "0.9999980912903255742060098395"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.800000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "1609.00",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999987005595158676188139457"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "397522.91",
+      "proposed_price": "0.0000",
+      "winner_bid": "0.810000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "253.00",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 104
+    },
+    "expected": "0.9999947921067220346891304177"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "0.0000",
+      "winner_bid": "0.800000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "1609.00",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999983898504194146718979231"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.800000",
+      "winner_ask": "0.860000",
+      "winner_bid_depth": "1812.03",
+      "loser_bid": "0.140000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999982359004885450631350035"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "2740.00",
+      "proposed_price": "0.0000",
+      "winner_bid": "0.050000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "1374.00",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999957994287047992058677542"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.500000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "4596.46",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999986545091019365576458925"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.500000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "2970.46",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999986287553286249808146311"
+  },
+  {
+    "input": {
+      "market_volume": "264.80",
+      "event_volume": "2624.24",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.800000",
+      "winner_ask": "0.900000",
+      "winner_bid_depth": "241.18",
+      "loser_bid": "0.100000",
+      "seconds_after_propose": 460
+    },
+    "expected": "0.9992541010897349358970316527"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.500000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "4596.46",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999986545091019365576458925"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "0.0000",
+      "winner_bid": "0.800000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "1609.00",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999983898504194146718979231"
+  },
+  {
+    "input": {
+      "market_volume": "0.00",
+      "event_volume": "0.00",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.800000",
+      "winner_ask": "0.990000",
+      "winner_bid_depth": "538.03",
+      "loser_bid": "0.010000",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.9999986372447234354539467394"
+  },
+  {
+    "input": {
+      "market_volume": "92.19",
+      "event_volume": "525.39",
+      "proposed_price": "1.0000",
+      "winner_bid": "0.800000",
+      "winner_ask": "0.900000",
+      "winner_bid_depth": "1449.00",
+      "loser_bid": "0.100000",
+      "seconds_after_propose": 199
+    },
+    "expected": "0.9997786852416889426356727706"
+  },
+  {
+    "input": {
+      "market_volume": "120000",
+      "event_volume": "500000",
+      "proposed_price": "1",
+      "winner_bid": "0.90",
+      "winner_ask": "0.99",
+      "winner_bid_depth": "500",
+      "loser_bid": "0.02",
+      "seconds_after_propose": 0
+    },
+    "expected": "0.7887020204828144685024200445"
+  },
+  {
+    "input": {
+      "market_volume": "120000",
+      "event_volume": "500000",
+      "proposed_price": "1",
+      "winner_bid": "0.90",
+      "winner_ask": "0.99",
+      "winner_bid_depth": "500",
+      "loser_bid": "0.02",
+      "seconds_after_propose": 60
+    },
+    "expected": "0.7895964022889174626409574090"
+  },
+  {
+    "input": {
+      "market_volume": "120000",
+      "event_volume": "500000",
+      "proposed_price": "1",
+      "winner_bid": "0.90",
+      "winner_ask": "0.99",
+      "winner_bid_depth": "500",
+      "loser_bid": "0.02",
+      "seconds_after_propose": 750
+    },
+    "expected": "0.7981905385250382944391259613"
+  },
+  {
+    "input": {
+      "market_volume": "120000",
+      "event_volume": "500000",
+      "proposed_price": "1",
+      "winner_bid": "0.90",
+      "winner_ask": "0.99",
+      "winner_bid_depth": "500",
+      "loser_bid": "0.02",
+      "seconds_after_propose": 3600
+    },
+    "expected": "0.8112895248487757977091545117"
+  },
+  {
+    "input": {
+      "market_volume": "120000",
+      "event_volume": "500000",
+      "proposed_price": "1",
+      "winner_bid": "0.90",
+      "winner_ask": "0.99",
+      "winner_bid_depth": "500",
+      "loser_bid": "0.02",
+      "seconds_after_propose": 7200
+    },
+    "expected": "0.8386368671182489264811865498"
+  },
+  {
+    "input": {
+      "market_volume": "120000",
+      "event_volume": "500000",
+      "proposed_price": "1",
+      "winner_bid": "0.90",
+      "winner_ask": "0.99",
+      "winner_bid_depth": "500",
+      "loser_bid": "0.02",
+      "seconds_after_propose": 10000
+    },
+    "expected": "0.8386368671182489264811865498"
+  }
+]

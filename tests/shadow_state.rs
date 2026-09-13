@@ -29,16 +29,16 @@ fn guards_use_cached_context_and_keep_threshold_boundaries() -> anyhow::Result<(
         "fees_enabled":false,"fee_schedule":null,"fee_verification_status":"unverified",
         "has_disputed_resolution":false,"existing_order_count":0,
         "resolution":{"id":1,"request_id":"r","status":"proposed","proposed_price":"1","propose_time_ms":1000,"block_number":10,"dispute_block_number":null,"settle_block_number":null,"disputed":false,"settled":false},
+        "market_volume":"0","event_volume":"0",
         "valuation":{"expected_payout":"0.999","calculated_at_ms":1000}
     }))?;
     let policy: Policy = serde_json::from_value(
-        json!({"manual_trade_shutdown_enabled":false,"strategy_enabled":true,"max_ask_price":"0.999","max_orders_per_market":5,"ev_threshold":"0.0001","order_size_usd":"5","low_price_order_size_usd":"10","low_depth_099_order_size_usd":"10"}),
+        json!({"valuation_key":"m5_expected_payout","manual_trade_shutdown_enabled":false,"strategy_enabled":true,"max_ask_price":"0.999","max_orders_per_market":5,"ev_threshold":"0.0001","order_size_usd":"5","low_price_order_size_usd":"10","low_depth_099_order_size_usd":"10"}),
     )?;
     let mut life = Lifecycle::default();
     life.seed("m", context.resolution.as_ref().unwrap());
     let test = |price: &str, depth: &str, ctx: MarketContext| -> Option<&'static str> {
-        let book =
-            json!({"token_id":"1","best_ask":{"price":price,"size":depth},"tick_size":"0.001"});
+        let book = json!({"token_id":"1","best_ask":{"price":price,"size":depth},"tick_size":"0.001","loser_bid":"0"});
         decide(
             Arc::new(ctx),
             &policy,
@@ -75,10 +75,7 @@ fn guards_use_cached_context_and_keep_threshold_boundaries() -> anyhow::Result<(
     assert_eq!(test("0.90", "100", fees), Some("fee_schedule_unavailable"));
     let mut exhausted = context;
     exhausted.existing_order_count = 5;
-    assert_eq!(
-        test("0.90", "100", exhausted),
-        Some("max_orders_per_market")
-    );
+    assert_eq!(test("0.90", "100", exhausted), None);
     Ok(())
 }
 

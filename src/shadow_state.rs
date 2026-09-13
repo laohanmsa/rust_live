@@ -204,6 +204,8 @@ pub struct Valuation {
 pub struct MarketContext {
     pub market_id: String,
     pub question: String,
+    pub market_volume: Option<Decimal>,
+    pub event_volume: Option<Decimal>,
     pub tags: Vec<String>,
     pub eligible: bool,
     pub token_id_yes: Option<String>,
@@ -227,6 +229,7 @@ pub struct MarketContext {
 }
 #[derive(Clone, Deserialize)]
 pub struct Policy {
+    pub valuation_key: Option<String>,
     pub manual_trade_shutdown_enabled: bool,
     pub strategy_enabled: bool,
     pub max_ask_price: Decimal,
@@ -250,6 +253,7 @@ pub struct Decision {
     pub context: Arc<MarketContext>,
     pub price: Decimal,
     pub shares: Decimal,
+    pub tick: Decimal,
     pub budget: Decimal,
     pub fair_value: Decimal,
     pub request_id: String,
@@ -330,7 +334,21 @@ pub fn decide(
         return Err("market_not_disputed");
     }
     let price = decimal(&book["best_ask"]["price"]).ok_or("missing_ask")?;
-    let depth = decimal(&book["best_ask"]["size"]).ok_or("missing_ask_depth")?;
+    let depth = if let Some(levels) = book["top_5_asks"].as_array() {
+        levels
+            .iter()
+            .take(5)
+            .map(|v| {
+                decimal(&v["size"])
+                    .filter(|s| *s >= Decimal::ZERO)
+                    .ok_or("invalid_ask_depth")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum()
+    } else {
+        decimal(&book["best_ask"]["size"]).ok_or("missing_ask_depth")?
+    };
     if price <= Decimal::ZERO || price >= Decimal::ONE || depth <= Decimal::ZERO {
         return Err("invalid_ask");
     }
@@ -349,22 +367,40 @@ pub fn decide(
         return Err("missing_market_rules");
     };
     let tick = decimal(&book["tick_size"]).unwrap_or(context.min_tick_size);
-    if tick <= Decimal::ZERO || tick != context.min_tick_size {
-        return Err("tick_metadata_mismatch");
+    if tick <= Decimal::ZERO {
+        return Err("invalid_tick_metadata");
     }
     if price < tick || price > Decimal::ONE - tick || price % tick != Decimal::ZERO {
         return Err("min_tick_price_or_alignment");
     }
-    let valuation = context
-        .valuation
-        .as_ref()
-        .ok_or("missing_current_valuation")?;
-    if now.saturating_sub(valuation.calculated_at_ms) > 300_000 {
-        return Err("stale_valuation");
+    if policy.valuation_key.as_deref() != Some("m5_expected_payout") {
+        return Err("unsupported_valuation_model");
     }
-    if valuation.expected_payout <= Decimal::ZERO || valuation.expected_payout > Decimal::ONE {
-        return Err("invalid_valuation");
-    }
+    let bid_depth = if let Some(levels) = book["top_5_bids"].as_array() {
+        levels
+            .iter()
+            .take(5)
+            .map(|v| {
+                decimal(&v["size"])
+                    .filter(|s| *s >= Decimal::ZERO)
+                    .ok_or("invalid_bid_depth")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum()
+    } else {
+        decimal(&book["best_bid"]["size"]).unwrap_or_default()
+    };
+    let fair_value = crate::shadow_valuation::expected_payout(&crate::shadow_valuation::M5Input {
+        market_volume: context.market_volume.ok_or("missing_market_volume")?,
+        event_volume: context.event_volume.ok_or("missing_event_volume")?,
+        proposed_price: r.proposed_price,
+        seconds_after_propose: now.saturating_sub(r.propose_time_ms) / 1000,
+        winner_bid: decimal(&book["best_bid"]["price"]).unwrap_or_default(),
+        winner_ask: price,
+        winner_bid_depth: bid_depth,
+        loser_bid: decimal(&book["loser_bid"]).ok_or("missing_loser_book")?,
+    })?;
     let fee = if context.fees_enabled {
         let fee = context
             .fee_schedule
@@ -381,7 +417,7 @@ pub fn decide(
     } else {
         Decimal::ZERO
     };
-    if valuation.expected_payout - price - fee <= policy.ev_threshold {
+    if fair_value - price - fee <= policy.ev_threshold {
         return Err("ev_below_threshold");
     }
     let budget = if price < d("0.05") {
@@ -413,7 +449,7 @@ pub fn decide(
     {
         history.pop_front();
     }
-    if (history.len() as u64).max(context.existing_order_count) >= policy.max_orders_per_market {
+    if history.len() as u64 >= policy.max_orders_per_market {
         return Err("max_orders_per_market");
     }
     if reservations
@@ -423,7 +459,6 @@ pub fn decide(
     {
         return Err("market_cooldown");
     }
-    let fair_value = valuation.expected_payout;
     let request_id = request.to_owned();
     let block = r.block_number.unwrap_or(0);
     history.push_back(now);
@@ -434,6 +469,7 @@ pub fn decide(
         context,
         price,
         shares,
+        tick,
         budget,
         fair_value,
         request_id,
