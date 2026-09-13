@@ -9,9 +9,7 @@ import re
 import shlex
 import subprocess
 import sys
-import urllib.request
-import urllib.error
-import time
+
 
 ROOT=Path(__file__).resolve().parents[1]
 REGISTRY='ams.vultrcr.com/polym'
@@ -54,13 +52,12 @@ def registry_key(path):
 def credentials(env_path):
     key=registry_key(env_path)
     def api(path,method='GET'):
-        req=urllib.request.Request('https://api.vultr.com/v2/'+path,method=method,headers={'Authorization':'Bearer '+key})
-        for attempt in range(3):
-            try:
-                with urllib.request.urlopen(req,timeout=30) as response: return json.load(response)
-            except urllib.error.URLError as error:
-                if attempt==2 or (isinstance(error,urllib.error.HTTPError) and error.code not in (429,500,502,503,504)): raise
-                time.sleep(attempt+1)
+        if '\n' in key or '\r' in key: raise RuntimeError('invalid registry credential format')
+        config='url = '+json.dumps('https://api.vultr.com/v2/'+path)+'\nheader = '+json.dumps('Authorization: Bearer '+key)+'\n'
+        result=subprocess.run(['curl','--config','-','--silent','--show-error','--fail',
+            '--connect-timeout','10','--max-time','30','--retry','2','--retry-delay','1',
+            '--retry-all-errors','--request',method],input=config.encode(),stdout=subprocess.PIPE,check=True)
+        return json.loads(result.stdout)
     entries=api('registries')['registries']
     matches=[r for r in entries if r.get('name')=='polym' and r.get('region')=='ams']
     if len(matches)!=1: raise RuntimeError('could not uniquely resolve the existing ams/polym registry')
