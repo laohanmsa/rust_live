@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM rust:1.96-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN rustup component add clippy rustfmt
 WORKDIR /source
 ENV CARGO_BUILD_JOBS=4
 COPY Cargo.toml Cargo.lock ./

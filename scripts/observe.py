@@ -114,7 +114,7 @@ def render(data):
     print(f"Journal: {r['journal_bytes']} bytes | restarts: {data['restarts']} | network/disk are cumulative container counters")
     print(f"Since boot: received={m['received']}, completed={m['completed']}, replayed={m['replayed']}; queue={m['queued']}, active={m['active']}")
     print(f"Observation window: {m['window_seconds']}s; retained={m['window_samples']}/{m['sample_capacity']}; truncated={m['window_truncated']}")
-    print('States: '+json.dumps(m['states'])+' | Reasons: '+json.dumps(m['reasons']))
+    print('Response states (including replays): '+json.dumps(m['states'])+' | Reasons: '+json.dumps(m['reasons']))
     print(f"{'Stage (milliseconds)':26} {'n':>5} {'p50':>10} {'p95':>10} {'p99':>10} {'max':>10}")
     for stage, row in m['latency_ms'].items():
         fmt=lambda x: '-' if x is None else f'{x:.3f}'
