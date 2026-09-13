@@ -72,6 +72,7 @@ async fn http_signature_deduplication_policy_budget_and_restart() -> anyhow::Res
     );
     let accepted = app.send(&first).await?;
     assert_eq!(accepted["state"], "accepted", "{accepted}");
+    assert_eq!(accepted["submitted_amount"], "0.99");
     assert!(accepted["dispatch_ms"].as_f64().is_some());
     assert_eq!(
         app.send(&first).await?["order_hash"],

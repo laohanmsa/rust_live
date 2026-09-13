@@ -154,14 +154,17 @@ impl Journal {
         }
         Ok(())
     }
-    pub fn prepare(&mut self, entry: Stored, budget: Decimal) -> Result<Option<Reply>> {
+    pub fn prepare(&mut self, entry: Stored, budget: Option<Decimal>) -> Result<Option<Reply>> {
         ensure!(!self.failed, "journal is poisoned");
         if let Some(old) = self.orders.get(&entry.signal.id) {
             ensure!(old.signal == entry.signal, "id_conflict");
             return Ok(Some(old.reply.clone()));
         }
         ensure!(self.orders.len() < 50000, "journal_capacity");
-        ensure!(self.used + entry.reserved <= budget, "budget_exhausted");
+        ensure!(
+            budget.is_none_or(|limit| self.used + entry.reserved <= limit),
+            "budget_exhausted"
+        );
         self.append(&Record::Prepared {
             entry: entry.clone(),
         })?;

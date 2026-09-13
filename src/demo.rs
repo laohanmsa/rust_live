@@ -130,6 +130,10 @@ fn verify(headers: &HeaderMap, bytes: &[u8]) -> Result<String> {
         order.makerAmount > U256::ZERO && order.takerAmount > U256::ZERO,
         "empty order"
     );
+    ensure!(
+        order.makerAmount % U256::from(10_000) == U256::ZERO,
+        "FAK BUY cash must have at most two decimal places"
+    );
     let sig: Signature = o["signature"].as_str().unwrap_or("").parse()?;
     let mut verified = None;
     for neg_risk in [false, true] {

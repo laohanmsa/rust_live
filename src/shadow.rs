@@ -46,7 +46,7 @@ pub struct Settings {
     pub max_inflight: usize,
     pub context_max_age_ms: u64,
     pub max_order_budget_pusd: Decimal,
-    pub total_budget_pusd: Decimal,
+    pub total_budget_pusd: Option<Decimal>,
 }
 impl Settings {
     pub fn read(path: &Path) -> Result<Self> {
@@ -66,8 +66,9 @@ impl Settings {
             "invalid per-order mock budget"
         );
         ensure!(
-            s.total_budget_pusd >= s.max_order_budget_pusd
-                && s.total_budget_pusd <= Decimal::from(10000),
+            s.total_budget_pusd.is_none_or(
+                |budget| budget >= s.max_order_budget_pusd && budget <= Decimal::from(10000)
+            ),
             "invalid mock session budget"
         );
         Ok(s)
@@ -723,6 +724,7 @@ impl App {
         };
         r.sign_ms = elapsed_ms(started);
         r.order_hash = Some(signed.hash.clone());
+        r.submitted_amount = Some(signed.cash_amount);
         r.state = "prepared".into();
         let entry = Stored {
             signal: signal.clone(),
@@ -847,7 +849,7 @@ async fn metrics(
     let history_error = data.history_error.clone();
     drop(data);
     let ledger = app.journal.lock().await;
-    result["history"] = json!({"exported":ledger.exported.len(),"pending":ledger.orders.values().filter(|o|matches!(o.reply.state.as_str(), "accepted" | "unknown" | "rejected")&&!ledger.exported.contains(&o.signal.id)).count(),"budget_used":ledger.used.to_string(),"budget_limit":app.settings.total_budget_pusd.to_string(),"error":history_error});
+    result["history"] = json!({"exported":ledger.exported.len(),"pending":ledger.orders.values().filter(|o|matches!(o.reply.state.as_str(), "accepted" | "unknown" | "rejected")&&!ledger.exported.contains(&o.signal.id)).count(),"budget_used":ledger.used.to_string(),"budget_limit":app.settings.total_budget_pusd.map(|v|v.to_string()),"error":history_error});
     (StatusCode::OK, Json(result))
 }
 async fn markets(State(app): State<Arc<App>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -878,9 +880,8 @@ pub async fn serve(settings: Settings) -> Result<()> {
 
 pub async fn serve_live(settings: Settings, path: &Path, account: &str) -> Result<()> {
     ensure!(
-        settings.total_budget_pusd <= Decimal::from(100)
-            && settings.max_order_budget_pusd <= Decimal::from(10),
-        "live pilot limits are 100 total and 10 per order"
+        settings.max_order_budget_pusd <= Decimal::from(10),
+        "live per-order limit is 10"
     );
     ensure!(
         settings.history_url.ends_with("/api/rust-live-orders/"),
@@ -1043,7 +1044,7 @@ mod tests {
                 max_inflight: 8,
                 context_max_age_ms: 90000,
                 max_order_budget_pusd: "10".parse()?,
-                total_budget_pusd: "100".parse()?,
+                total_budget_pusd: Some("100".parse()?),
             },
             data: RwLock::new(Data {
                 last_sync_ms: now,

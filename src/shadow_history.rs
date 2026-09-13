@@ -16,7 +16,7 @@ pub fn payload(entry: &Stored) -> Result<Value> {
         r.source_to_dispatch_ms
             .map(|elapsed| entry.signal.observed_at_ms + elapsed as u64)
     });
-    Ok(json!({
+    let mut body = json!({
         "schema_version":1,"dry_run":true,"signal_id":entry.signal.id,
         "token_id":entry.signal.token_id.to_string(),"price":entry.signal.ask.to_string(),
         "size":shares.normalize().to_string(),"signal_at_ms":entry.signal.observed_at_ms,
@@ -25,7 +25,14 @@ pub fn payload(entry: &Stored) -> Result<Value> {
         "timings":{"policy_ms":r.policy_ms,"sign_ms":r.sign_ms,"journal_ms":r.journal_ms,
             "dispatch_ms":r.dispatch_ms,"source_to_dispatch_ms":r.source_to_dispatch_ms,
             "post_ms":r.post_ms,"total_ms":r.total_ms}
-    }))
+    });
+    // Old journal entries omit this field, preserving their receipt retry digest.
+    if entry.signal.id.starts_with("live-")
+        && let Some(cash) = r.submitted_amount
+    {
+        body["submitted_amount"] = json!(cash.normalize().to_string());
+    }
+    Ok(body)
 }
 
 pub async fn export_once(

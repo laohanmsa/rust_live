@@ -23,6 +23,16 @@ fn live_acknowledgements_preserve_uncertainty_and_do_not_invent_fills() {
     assert!(r.clob_response.as_ref().unwrap().get("secret").is_none());
     apply_exchange_response(
         &mut r,
+        400,
+        &json!({"error":"invalid maker amount precision"}),
+    );
+    assert_eq!(
+        r.clob_response.as_ref().unwrap()["errorMsg"],
+        "invalid maker amount precision"
+    );
+    assert!(r.reason.contains("invalid maker amount precision"));
+    apply_exchange_response(
+        &mut r,
         200,
         &json!({"success":true,"orderID":"0xwrong","status":"matched"}),
     );

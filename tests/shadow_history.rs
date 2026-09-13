@@ -38,7 +38,7 @@ async fn signed_mock_order_retries_history_and_recovers_ack_without_resubmission
             order: signed.journal_order.clone(),
             reply: reply.clone(),
         },
-        "100".parse()?,
+        Some("100".parse()?),
     )?;
     let (status, _) = exchange.post(signed).await?;
     assert_eq!(status, 200);
@@ -86,6 +86,42 @@ async fn signed_mock_order_retries_history_and_recovers_ack_without_resubmission
     let recovered = Arc::new(Mutex::new(Journal::open(&path, &scope)?));
     assert_eq!(export_once(&http, &url, &recovered).await?, 0);
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+    let mut entry = recovered.lock().await.orders[&signal.id].clone();
+    entry.signal.id = format!("live-{}", "b".repeat(64));
+    entry.reply.id = entry.signal.id.clone();
+    entry.signal.ask = "0.999".parse()?;
+    entry.order["takerAmount"] = json!("4994990");
+    entry.order["makerAmount"] = json!("4990000");
+    assert!(
+        polym_rust_demo::shadow_history::payload(&entry)?
+            .get("submitted_amount")
+            .is_none()
+    );
+    entry.reply.submitted_amount = Some("4.99".parse()?);
+    let body = polym_rust_demo::shadow_history::payload(&entry)?;
+    assert_eq!(body["submitted_amount"], "4.99");
+    assert_eq!(body["size"], "4.99499");
+    for i in 0..12 {
+        entry.signal.id = format!("unlimited-{i}");
+        entry.reply.id = entry.signal.id.clone();
+        assert!(
+            recovered
+                .lock()
+                .await
+                .prepare(entry.clone(), None)?
+                .is_none()
+        );
+    }
+    assert_eq!(recovered.lock().await.used, "130".parse()?);
+    entry.signal.id = "still-capped".into();
+    entry.reply.id = entry.signal.id.clone();
+    assert!(
+        recovered
+            .lock()
+            .await
+            .prepare(entry, Some("100".parse()?))
+            .is_err()
+    );
     task.abort();
     drop(recovered);
     std::fs::remove_file(path.with_extension("history-acks.jsonl"))?;

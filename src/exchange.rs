@@ -38,6 +38,7 @@ pub struct Signed {
     pub wire: Vec<u8>,
     pub journal_order: Value,
     pub hash: String,
+    pub cash_amount: Decimal,
 }
 pub struct Exchange {
     pub client: Client<Authenticated<Normal>>,
@@ -143,14 +144,17 @@ impl Exchange {
         );
         self.client.set_tick_size(signal.token_id, tick.try_into()?);
         self.client.set_neg_risk(signal.token_id, neg_risk);
+        // Match Django's FAK BUY semantics: floor the cash amount to cents.
+        let cash = (signal.ask * shares).trunc_with_scale(2);
+        ensure!(cash > Decimal::ZERO, "empty_buy_amount");
         let order = self
             .client
-            .limit_order()
+            .market_order()
             .token_id(signal.token_id)
             .side(Side::Buy)
             .order_type(OrderType::FAK)
             .price(signal.ask)
-            .size(shares)
+            .amount(Amount::usdc(cash)?)
             .build()
             .await?;
         let OrderPayload::V2(payload) = &order.payload else {
@@ -163,6 +167,7 @@ impl Exchange {
             wire: serde_json::to_vec(&signed)?,
             journal_order: serde_json::to_value(&signed)?["order"].clone(),
             hash,
+            cash_amount: cash,
         })
     }
     pub async fn live() -> Result<Self> {
@@ -294,7 +299,7 @@ impl Exchange {
         Ok(markets)
     }
     pub async fn sign(&self, s: &Signal, budget: Decimal, market: &Market) -> Result<Signed> {
-        let order = self
+        let mut order = self
             .client
             .market_order()
             .token_id(s.token_id)
@@ -305,9 +310,17 @@ impl Exchange {
             .user_usdc_balance(budget)
             .build()
             .await?;
-        let OrderPayload::V2(payload) = &order.payload else {
+        let OrderPayload::V2(payload) = &mut order.payload else {
             anyhow::bail!("unexpected protocol")
         };
+        // The SDK's balance adjustment has six decimals; FAK cash accepts cents.
+        let units = Decimal::from(1_000_000);
+        let cash_amount = (Decimal::from_str(&payload.order.makerAmount.to_string())? / units)
+            .trunc_with_scale(2);
+        ensure!(cash_amount > Decimal::ZERO, "empty_buy_amount");
+        let shares = (cash_amount / s.ask).trunc_with_scale(market.tick.normalize().scale() + 2);
+        payload.order.makerAmount = (cash_amount * units).trunc().to_string().parse()?;
+        payload.order.takerAmount = (shares * units).trunc().to_string().parse()?;
         ensure!(
             Decimal::from_str(&payload.order.takerAmount.to_string())? / Decimal::from(1_000_000)
                 >= market.min_size,
@@ -323,6 +336,7 @@ impl Exchange {
             wire,
             journal_order,
             hash,
+            cash_amount,
         })
     }
     pub async fn post(&self, signed: Signed) -> Result<(u16, Value)> {
@@ -365,7 +379,23 @@ impl Exchange {
             ensure!(body.len() + chunk.len() <= 65536, "oversized response");
             body.extend_from_slice(&chunk);
         }
-        let value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        let mut value: Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"errorMsg":"exchange returned a non-JSON response"}));
+        for field in ["error", "errorMsg"] {
+            if let Some(message) = value[field].as_str() {
+                let mut message = message.to_owned();
+                for secret in [
+                    self.credentials.key().to_string(),
+                    self.credentials.secret().expose_secret().to_owned(),
+                    self.credentials.passphrase().expose_secret().to_owned(),
+                ] {
+                    if !secret.is_empty() {
+                        message = message.replace(&secret, "[redacted]");
+                    }
+                }
+                value[field] = json!(message.chars().take(200).collect::<String>());
+            }
+        }
         Ok((status, value))
     }
 }
@@ -385,6 +415,37 @@ pub fn auth_signature(
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    #[tokio::test]
+    async fn fak_buy_rounds_cash_down_to_cents_without_metadata_reads() -> Result<()> {
+        let mock = crate::demo::MockExchange::start().await?;
+        let exchange = Exchange::shadow(&mock.url).await?;
+        let reads = mock
+            .state
+            .public_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        for (price, tick, cash) in [
+            ("0.969", "0.001", "4840000"),
+            ("0.999", "0.001", "4990000"),
+            ("0.9999", "0.0001", "4990000"),
+            ("0.98", "0.01", "4900000"),
+        ] {
+            let mut signal = crate::demo::signal("precision");
+            signal.ask = price.parse()?;
+            let signed = exchange
+                .sign_shadow(&signal, "5".parse()?, tick.parse()?, false)
+                .await?;
+            assert_eq!(signed.journal_order["makerAmount"], cash, "price {price}");
+            let (status, body) = exchange.post(signed).await?;
+            assert_eq!(status, 200, "{body}");
+        }
+        assert_eq!(
+            mock.state
+                .public_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            reads
+        );
+        Ok(())
+    }
     #[tokio::test]
     async fn proxy_signing_and_single_submit_use_the_configured_funder() -> Result<()> {
         let mock = crate::demo::MockExchange::start().await?;

@@ -126,6 +126,8 @@ pub struct Signal {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_amount: Option<Decimal>,
     #[serde(default)]
     pub clob_response: Option<Value>,
     #[serde(default)]
@@ -151,6 +153,7 @@ pub struct Reply {
 impl Reply {
     fn blocked(id: &str, reason: &str) -> Self {
         Self {
+            submitted_amount: None,
             clob_response: None,
             submitted_at_ms: None,
             replayed: false,
@@ -190,6 +193,20 @@ pub fn apply_exchange_response(reply: &mut Reply, status: u16, body: &Value) {
         .filter_map(|key| body.get(key).map(|v| (key.to_owned(), v.clone())))
         .collect(),
     ));
+    let error = body["errorMsg"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .map(|s| {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect::<String>()
+        });
+    if let Some(error) = &error
+        && let Some(response) = reply.clob_response.as_mut()
+    {
+        response["errorMsg"] = json!(error);
+    }
     if (200..300).contains(&status)
         && body["success"] == true
         && body["orderID"].as_str() == reply.order_hash.as_deref()
@@ -207,6 +224,9 @@ pub fn apply_exchange_response(reply: &mut Reply, status: u16, body: &Value) {
     {
         reply.state = "rejected".into();
         reply.reason = format!("exchange_rejected_http_{status}");
+        if let Some(error) = error.filter(|e| !e.is_empty()) {
+            reply.reason.push_str(&format!(": {error}"));
+        }
     } else {
         reply.state = "unknown".into();
         reply.reason = "submission_uncertain".into();
@@ -488,6 +508,7 @@ async fn process(ctx: Arc<ContextState>, s: &Signal, received: Instant) -> Reply
     result.policy_ms = Some(policy_ms);
     result.state = "prepared".into();
     result.order_hash = Some(signed.hash.clone());
+    result.submitted_amount = Some(signed.cash_amount);
     result.queue_ms = queue_ms;
     result.sign_ms = elapsed_ms(sign_start);
     let entry = journal::Stored {
@@ -498,7 +519,7 @@ async fn process(ctx: Arc<ContextState>, s: &Signal, received: Instant) -> Reply
     };
     let journal_start = Instant::now();
     let ledger = ctx.journal.clone();
-    let budget = ctx.config.total_budget_pusd;
+    let budget = Some(ctx.config.total_budget_pusd);
     // ponytail: one durable writer per process; move to the shared PostgreSQL ledger before multiple executors.
     match tokio::task::spawn_blocking(move || ledger.blocking_lock().prepare(entry, budget)).await {
         Ok(Ok(Some(mut existing))) => {
