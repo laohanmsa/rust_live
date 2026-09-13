@@ -1,0 +1,15 @@
+{
+  "tokens": [
+    "1"
+  ],
+  "order_budget_pusd": "1.00",
+  "total_budget_pusd": "10000.00",
+  "min_edge": "0.01",
+  "max_price": "0.99",
+  "max_signal_age_ms": 200,
+  "max_inflight": 16,
+  "queue_capacity": 64,
+  "request_timeout_ms": 1000,
+  "metadata_ttl_ms": 300000,
+  "journal": "/app/data/orders.jsonl"
+}

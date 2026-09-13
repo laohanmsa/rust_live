@@ -1,0 +1,8 @@
+/target/
+/data/
+.env
+.env.*
+!.env.example
+config.live.json
+/outputs/
+__pycache__/
