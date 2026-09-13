@@ -1,0 +1,47 @@
+name: polym-rust-demo
+services:
+  trader:
+    image: ${DEMO_IMAGE:?set immutable DEMO_IMAGE digest}
+    command: ["trade-live", "/app/live.json", "/run/secrets/live_credentials", "airdrop_224"]
+    networks: [default, polym-data]
+    environment:
+      DEMO_BIND: 0.0.0.0:8787
+      TOKIO_WORKER_THREADS: "2"
+      DEMO_MOCK_DELAY_MS: "50"
+    ports:
+      - "127.0.0.1:18787:8787"
+    volumes:
+      - order-data:/app/data
+    secrets: [live_credentials]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.50
+    mem_limit: 256m
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+volumes:
+  order-data:
+
+networks:
+  polym-data:
+    external: true
+    name: polym_amster_polym
+
+secrets:
+  live_credentials:
+    file: /opt/polym-rust-demo/secrets/airdrop_224.json

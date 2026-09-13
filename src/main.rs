@@ -17,6 +17,18 @@ async fn main() -> Result<()> {
             ))?)
             .await
         }
+        "trade-live" => {
+            ensure!(
+                args.len() == 4,
+                "usage: trade-live CONFIG CREDENTIALS ACCOUNT"
+            );
+            polym_rust_demo::shadow::serve_live(
+                polym_rust_demo::shadow::Settings::read(Path::new(&args[1]))?,
+                Path::new(&args[2]),
+                &args[3],
+            )
+            .await
+        }
         "serve" => {
             let live = args.iter().any(|x| x == "--live");
             ensure!(args.len() <= 3, "usage: serve [config.json] [--live]");

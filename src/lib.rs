@@ -127,6 +127,8 @@ pub struct Signal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
     #[serde(default)]
+    pub clob_response: Option<Value>,
+    #[serde(default)]
     pub submitted_at_ms: Option<u64>,
     #[serde(default)]
     pub replayed: bool,
@@ -149,6 +151,7 @@ pub struct Reply {
 impl Reply {
     fn blocked(id: &str, reason: &str) -> Self {
         Self {
+            clob_response: None,
             submitted_at_ms: None,
             replayed: false,
             policy_ms: None,
@@ -166,6 +169,45 @@ impl Reply {
             dispatch_ms: None,
             total_ms: 0.0,
         }
+    }
+}
+
+pub fn apply_exchange_response(reply: &mut Reply, status: u16, body: &Value) {
+    reply.exchange_status = None;
+    let exchange_status = body["status"].as_str().unwrap_or("").to_ascii_lowercase();
+    reply.clob_response = Some(Value::Object(
+        [
+            "success",
+            "errorMsg",
+            "orderID",
+            "status",
+            "makingAmount",
+            "takingAmount",
+            "transactionsHashes",
+            "tradeIDs",
+        ]
+        .into_iter()
+        .filter_map(|key| body.get(key).map(|v| (key.to_owned(), v.clone())))
+        .collect(),
+    ));
+    if (200..300).contains(&status)
+        && body["success"] == true
+        && body["orderID"].as_str() == reply.order_hash.as_deref()
+        && ["matched", "delayed", "live", "unmatched"].contains(&exchange_status.as_str())
+    {
+        reply.state = "accepted".into();
+        reply.reason.clear();
+        reply.exchange_status = Some(exchange_status);
+    } else if [400, 401, 403, 404, 422, 429].contains(&status)
+        || ((200..300).contains(&status)
+            && body["success"] == false
+            && body["orderID"].as_str().is_none_or(str::is_empty))
+    {
+        reply.state = "rejected".into();
+        reply.reason = format!("exchange_rejected_http_{status}");
+    } else {
+        reply.state = "unknown".into();
+        reply.reason = "submission_uncertain".into();
     }
 }
 type ApiReply = (StatusCode, Json<Value>);
@@ -497,23 +539,7 @@ async fn process(ctx: Arc<ContextState>, s: &Signal, received: Instant) -> Reply
         )
         .await
         {
-            let exchange_status = body["status"].as_str().unwrap_or("").to_ascii_lowercase();
-            if (200..300).contains(&status)
-                && body["success"] == true
-                && body["orderID"].as_str() == result.order_hash.as_deref()
-                && ["matched", "delayed", "live", "unmatched"].contains(&exchange_status.as_str())
-            {
-                result.state = "accepted".into();
-                result.reason.clear();
-                result.exchange_status = Some(exchange_status);
-            } else if [400, 401, 403, 404, 422, 429].contains(&status)
-                || ((200..300).contains(&status)
-                    && body["success"] == false
-                    && body["orderID"].as_str().is_none_or(str::is_empty))
-            {
-                result.state = "rejected".into();
-                result.reason = format!("exchange_rejected_http_{status}");
-            }
+            apply_exchange_response(&mut result, status, &body);
         }
         result.post_ms = Some(elapsed_ms(post_start));
         if result.state == "unknown" {

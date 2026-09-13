@@ -17,8 +17,11 @@ use polymarket_client_sdk_v2::{
     types::{Address, Decimal, U256},
 };
 use reqwest::header::{HeaderMap, HeaderValue};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -44,7 +47,60 @@ pub struct Exchange {
     mode: &'static str,
     funder: Option<Address>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCredentials {
+    pub account_name: String,
+    pub account_id: u64,
+    pub signer_address: Address,
+    pub funder: Address,
+    pub private_key: String,
+    pub api_key: String,
+    pub api_secret: String,
+    pub api_passphrase: String,
+    pub access_token: String,
+}
+impl LiveCredentials {
+    pub fn read(path: &Path, account: &str) -> Result<Self> {
+        ensure!(
+            std::fs::metadata(path)?.permissions().mode() & 0o077 == 0,
+            "credentials must not be group/world readable"
+        );
+        let value: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(
+            value.account_name == account && value.account_id > 0 && value.access_token.len() >= 32,
+            "live account authorization mismatch"
+        );
+        Ok(value)
+    }
+}
 impl Exchange {
+    pub async fn authorized_live(c: &LiveCredentials) -> Result<Self> {
+        let exchange = Self::connect(
+            "https://clob.polymarket.com",
+            "live",
+            &c.private_key,
+            Credentials::new(
+                c.api_key.parse().context("invalid API key format")?,
+                c.api_secret.clone(),
+                c.api_passphrase.clone(),
+            ),
+            SignatureType::GnosisSafe,
+            Some(c.funder),
+        )
+        .await?;
+        ensure!(
+            exchange.signer.address() == c.signer_address,
+            "private key does not match selected account"
+        );
+        ensure!(
+            tokio::time::timeout(Duration::from_secs(5), exchange.client.version()).await?? == 2,
+            "CLOB v2 required"
+        );
+        tokio::time::timeout(Duration::from_secs(5), exchange.client.api_keys()).await??;
+        Ok(exchange)
+    }
     pub async fn demo(host: &str) -> Result<Self> {
         let url: reqwest::Url = host.parse()?;
         ensure!(
@@ -82,8 +138,8 @@ impl Exchange {
         neg_risk: bool,
     ) -> Result<Signed> {
         ensure!(
-            self.mode == "shadow",
-            "shadow signing requires mock-only exchange"
+            matches!(self.mode, "shadow" | "live"),
+            "cached signing requires an initialized trading exchange"
         );
         self.client.set_tick_size(signal.token_id, tick.try_into()?);
         self.client.set_neg_risk(signal.token_id, neg_risk);
@@ -324,4 +380,41 @@ pub fn auth_signature(
     mac.update(format!("{timestamp}{method}{path}").as_bytes());
     mac.update(body);
     Ok(URL_SAFE.encode(mac.finalize().into_bytes()))
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    #[tokio::test]
+    async fn proxy_signing_and_single_submit_use_the_configured_funder() -> Result<()> {
+        let mock = crate::demo::MockExchange::start().await?;
+        let funder: Address = "0x3434343434343434343434343434343434343434".parse()?;
+        let exchange = Exchange::connect(
+            &mock.url,
+            "shadow",
+            crate::demo::KEY,
+            Credentials::new(
+                Uuid::nil(),
+                crate::demo::SECRET.into(),
+                "demo-passphrase".into(),
+            ),
+            SignatureType::GnosisSafe,
+            Some(funder),
+        )
+        .await?;
+        let signed = exchange
+            .sign_shadow(
+                &crate::demo::signal("proxy"),
+                "10".parse()?,
+                "0.01".parse()?,
+                false,
+            )
+            .await?;
+        assert_eq!(signed.journal_order["maker"], funder.to_string());
+        assert_eq!(signed.journal_order["signatureType"], 2);
+        let (status, body) = exchange.post(signed).await?;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["success"], true);
+        Ok(())
+    }
 }

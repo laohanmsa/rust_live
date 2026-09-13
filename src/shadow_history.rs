@@ -33,6 +33,25 @@ pub async fn export_once(
     url: &str,
     journal: &Arc<Mutex<Journal>>,
 ) -> Result<usize> {
+    export(http, url, journal, None).await
+}
+
+pub async fn export_live_once(
+    http: &reqwest::Client,
+    url: &str,
+    journal: &Arc<Mutex<Journal>>,
+    account: &str,
+    token: &str,
+) -> Result<usize> {
+    export(http, url, journal, Some((account, token))).await
+}
+
+async fn export(
+    http: &reqwest::Client,
+    url: &str,
+    journal: &Arc<Mutex<Journal>>,
+    live: Option<(&str, &str)>,
+) -> Result<usize> {
     // ponytail: scan at most 50,000 bounded journal rows; add a pending index if profiling warrants it.
     let batch = {
         let ledger = journal.lock().await;
@@ -40,8 +59,11 @@ pub async fn export_once(
             .orders
             .values()
             .filter(|o| {
-                o.signal.id.starts_with("shadow-")
-                    && matches!(o.reply.state.as_str(), "accepted" | "unknown")
+                o.signal
+                    .id
+                    .starts_with(if live.is_some() { "live-" } else { "shadow-" })
+                    && (matches!(o.reply.state.as_str(), "accepted" | "unknown")
+                        || (live.is_some() && o.reply.state == "rejected"))
                     && !ledger.exported.contains(&o.signal.id)
             })
             .take(25)
@@ -50,9 +72,19 @@ pub async fn export_once(
     };
     let mut count = 0;
     for entry in batch {
-        let body = payload(&entry)?;
-        let response: Value = http
-            .post(url)
+        let mut body = payload(&entry)?;
+        let mut request = http.post(url);
+        if let Some((account, token)) = live {
+            body["dry_run"] = json!(false);
+            body["account_name"] = json!(account);
+            body["clob_response"] = entry
+                .reply
+                .clob_response
+                .clone()
+                .unwrap_or_else(|| json!({}));
+            request = request.bearer_auth(token);
+        }
+        let response: Value = request
             .json(&body)
             .send()
             .await?
@@ -60,7 +92,7 @@ pub async fn export_once(
             .json()
             .await?;
         ensure!(
-            response["dry_run"] == true
+            response["dry_run"] == live.is_none()
                 && response["signal_id"] == entry.signal.id
                 && response["id"].as_u64().is_some(),
             "invalid history acknowledgement"

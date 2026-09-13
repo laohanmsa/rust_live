@@ -18,6 +18,7 @@ import uuid
 ROOT = '/opt/polym-rust-demo'
 URL = 'http://127.0.0.1:18787'
 TOKEN = 'demo-local-only'
+LIVE = False
 
 
 def command(*args):
@@ -25,7 +26,8 @@ def command(*args):
 
 
 def get(path):
-    req = urllib.request.Request(URL + path, headers={'Authorization': 'Bearer ' + TOKEN})
+    token = command('sudo','-n','cat',ROOT+'/secrets/access.token') if LIVE else TOKEN
+    req = urllib.request.Request(URL + path, headers={'Authorization': 'Bearer ' + token})
     with urllib.request.urlopen(req, timeout=5) as response:
         return json.load(response)
 
@@ -57,12 +59,14 @@ def demo_load(count, result):
 
 
 def collect(args):
+    global LIVE
     cid = command('sudo', '-n', 'docker', 'compose', '-p', 'polym-rust-demo',
                   '--env-file', ROOT+'/image.env', '-f', ROOT+'/compose.yaml', 'ps', '-q', 'trader')
     if not re.fullmatch(r'[a-f0-9]{12,64}', cid):
         raise RuntimeError('prototype container is not running')
     info = json.loads(command('sudo', '-n', 'docker', 'inspect', cid))[0]
     health = get('/health')
+    LIVE = health.get('mode') == 'live'
     exercise = {}
     load = None
     if args.exercise_demo:
@@ -115,7 +119,7 @@ def render(data):
     print(f"Since boot: received={m['received']}, completed={m['completed']}, replayed={m['replayed']}; queue={m['queued']}, active={m['active']}")
     print(f"Observation window: {m['window_seconds']}s; retained={m['window_samples']}/{m['sample_capacity']}; truncated={m['window_truncated']}")
     if m.get('history'):
-        print('Dashboard dry-run history: '+json.dumps(m['history']))
+        print('Dashboard order history: '+json.dumps(m['history']))
     if m.get('sources'):
         sources=dict(m['sources']);sources.pop('recent_mock_orders',None);sources.pop('recent_rejections',None)
         print('Real-data sources: '+json.dumps(sources))

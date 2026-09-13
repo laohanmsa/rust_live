@@ -90,9 +90,20 @@ struct Data {
     restore: Vec<(String, u64)>,
     clocks: BTreeMap<String, u64>,
     history_error: String,
+    live_ready_at_ms: u64,
     rejections: VecDeque<Value>,
 }
+struct LiveAccount {
+    name: String,
+    id: u64,
+    signer: String,
+    funder: String,
+    token: String,
+}
+
 struct App {
+    live: Option<LiveAccount>,
+    history_notify: Notify,
     settings: Settings,
     data: RwLock<Data>,
     telemetry: Telemetry,
@@ -108,23 +119,71 @@ struct App {
     http: reqwest::Client,
 }
 impl App {
+    fn access_token(&self) -> &str {
+        self.live
+            .as_ref()
+            .map_or(demo::ACCESS, |a| a.token.as_str())
+    }
     async fn history_loop(self: Arc<Self>) {
         loop {
-            let result = crate::shadow_history::export_once(
-                &self.http,
-                &self.settings.history_url,
-                &self.journal,
-            )
-            .await;
+            let result = if let Some(account) = &self.live {
+                let ready = async {
+                    let response: Value = self
+                        .http
+                        .get(&self.settings.history_url)
+                        .bearer_auth(&account.token)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    anyhow::ensure!(
+                        response["account_name"] == account.name
+                            && response["account_id"] == account.id
+                            && response["signer_address"]
+                                .as_str()
+                                .is_some_and(|s| s.eq_ignore_ascii_case(&account.signer))
+                            && response["funder"]
+                                .as_str()
+                                .is_some_and(|s| s.eq_ignore_ascii_case(&account.funder)),
+                        "live identity mismatch"
+                    );
+                    Ok::<bool, anyhow::Error>(response["ready"] == true)
+                }
+                .await;
+                self.data.write().await.live_ready_at_ms = if matches!(ready, Ok(true)) {
+                    now_ms()
+                } else {
+                    0
+                };
+                crate::shadow_history::export_live_once(
+                    &self.http,
+                    &self.settings.history_url,
+                    &self.journal,
+                    &account.name,
+                    &account.token,
+                )
+                .await
+            } else {
+                crate::shadow_history::export_once(
+                    &self.http,
+                    &self.settings.history_url,
+                    &self.journal,
+                )
+                .await
+            };
             self.data.write().await.history_error = match result {
                 Ok(_) => String::new(),
                 Err(_) => "history_export_failed_retrying".into(),
             };
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! { _=self.history_notify.notified()=>{}, _=tokio::time::sleep(Duration::from_secs(2))=>{} }
         }
     }
     fn ready(&self, data: &Data) -> bool {
-        !self.stopped.load(Ordering::SeqCst)
+        (self.live.is_none()
+            || (now_ms().saturating_sub(data.live_ready_at_ms) < 10_000
+                && data.history_error.is_empty()))
+            && !self.stopped.load(Ordering::SeqCst)
             && self.nats_up.load(Ordering::SeqCst)
             && self.redis_up.load(Ordering::SeqCst)
             && data.synced_epoch == Some(self.redis_epoch.load(Ordering::SeqCst))
@@ -360,7 +419,15 @@ impl App {
         permit: tokio::sync::OwnedSemaphorePermit,
         received: Instant,
     ) {
-        let id = format!("shadow-{:x}", Sha256::digest(payload));
+        let id = format!(
+            "{}-{:x}",
+            if self.live.is_some() {
+                "live"
+            } else {
+                "shadow"
+            },
+            Sha256::digest(payload)
+        );
         let book = serde_json::from_slice::<Value>(payload);
         let mut reply = Reply::blocked(&id, "");
         let mut book = match book {
@@ -709,7 +776,13 @@ impl App {
                 r.source_to_dispatch_ms = Some(now_ms().saturating_sub(source_ms) as f64);
             }
             let started = Instant::now();
-            match tokio::time::timeout(Duration::from_secs(2), self.exchange.post(signed)).await {
+            match tokio::time::timeout(Duration::from_secs(5), self.exchange.post(signed)).await {
+                Ok(Ok((status, body))) if self.live.is_some() => {
+                    crate::apply_exchange_response(&mut r, status, &body);
+                    if r.state == "unknown" || [401, 403].contains(&status) {
+                        self.stopped.store(true, Ordering::SeqCst);
+                    }
+                }
                 Ok(Ok((200, body)))
                     if body["success"] == true
                         && body["orderID"].as_str() == r.order_hash.as_deref() =>
@@ -719,7 +792,7 @@ impl App {
                 }
                 _ => {
                     r.state = "unknown".into();
-                    r.reason = "mock_submission_uncertain".into();
+                    r.reason = "submission_uncertain".into();
                     self.stopped.store(true, Ordering::SeqCst);
                 }
             }
@@ -738,6 +811,7 @@ impl App {
             self.stopped.store(true, Ordering::SeqCst);
         }
         r.finalize_ms = Some(elapsed_ms(started));
+        self.history_notify.notify_one();
         r
     }
 }
@@ -748,7 +822,7 @@ struct Window {
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     let data = app.data.read().await;
     Json(
-        json!({"mode":"shadow","ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"data_sources":"Django + UMA + OBer","execution":"loopback_mock_only"}),
+        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"data_sources":"Django + UMA + OBer","execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
     )
 }
 async fn metrics(
@@ -756,7 +830,7 @@ async fn metrics(
     headers: HeaderMap,
     Query(w): Query<Window>,
 ) -> (StatusCode, Json<Value>) {
-    if !authorized(&headers, demo::ACCESS) {
+    if !authorized(&headers, app.access_token()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"unauthorized"})),
@@ -767,17 +841,17 @@ async fn metrics(
     let data = app.data.read().await;
     result["queued"] = json!(0);
     result["boot_at_ms"] = json!(app.boot_at_ms);
-    result["mode"] = json!("shadow");
+    result["mode"] = json!(app.exchange.mode());
     result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"valuation_mode":"local_m5","valuation_inputs":data.markets.values().filter(|c|c.market_volume.is_some()&&c.event_volume.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
     result["sources"]["recent_rejections"] = json!(data.rejections);
     let history_error = data.history_error.clone();
     drop(data);
     let ledger = app.journal.lock().await;
-    result["history"] = json!({"exported":ledger.exported.len(),"pending":ledger.orders.values().filter(|o|matches!(o.reply.state.as_str(), "accepted" | "unknown")&&!ledger.exported.contains(&o.signal.id)).count(),"error":history_error});
+    result["history"] = json!({"exported":ledger.exported.len(),"pending":ledger.orders.values().filter(|o|matches!(o.reply.state.as_str(), "accepted" | "unknown" | "rejected")&&!ledger.exported.contains(&o.signal.id)).count(),"budget_used":ledger.used.to_string(),"budget_limit":app.settings.total_budget_pusd.to_string(),"error":history_error});
     (StatusCode::OK, Json(result))
 }
 async fn markets(State(app): State<Arc<App>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
-    if !authorized(&headers, demo::ACCESS) {
+    if !authorized(&headers, app.access_token()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"unauthorized"})),
@@ -791,7 +865,7 @@ async fn markets(State(app): State<Arc<App>>, headers: HeaderMap) -> (StatusCode
     )
 }
 async fn stop(State(app): State<Arc<App>>, headers: HeaderMap) -> StatusCode {
-    if !authorized(&headers, demo::ACCESS) {
+    if !authorized(&headers, app.access_token()) {
         return StatusCode::UNAUTHORIZED;
     }
     app.stopped.store(true, Ordering::SeqCst);
@@ -799,9 +873,47 @@ async fn stop(State(app): State<Arc<App>>, headers: HeaderMap) -> StatusCode {
 }
 
 pub async fn serve(settings: Settings) -> Result<()> {
-    let mock = demo::MockExchange::start().await?;
-    mock.state.delay_ms.store(50, Ordering::SeqCst);
-    let exchange = Exchange::shadow(&mock.url).await?;
+    serve_inner(settings, None).await
+}
+
+pub async fn serve_live(settings: Settings, path: &Path, account: &str) -> Result<()> {
+    ensure!(
+        settings.total_budget_pusd <= Decimal::from(100)
+            && settings.max_order_budget_pusd <= Decimal::from(10),
+        "live pilot limits are 100 total and 10 per order"
+    );
+    ensure!(
+        settings.history_url.ends_with("/api/rust-live-orders/"),
+        "live history endpoint required"
+    );
+    let credentials = crate::exchange::LiveCredentials::read(path, account)?;
+    serve_inner(settings, Some(credentials)).await
+}
+
+async fn serve_inner(
+    settings: Settings,
+    credentials: Option<crate::exchange::LiveCredentials>,
+) -> Result<()> {
+    let mock = if credentials.is_none() {
+        Some(demo::MockExchange::start().await?)
+    } else {
+        None
+    };
+    if let Some(mock) = &mock {
+        mock.state.delay_ms.store(50, Ordering::SeqCst);
+    }
+    let exchange = if let Some(c) = &credentials {
+        Exchange::authorized_live(c).await?
+    } else {
+        Exchange::shadow(&mock.as_ref().context("missing mock")?.url).await?
+    };
+    let live = credentials.map(|c| LiveAccount {
+        name: c.account_name,
+        id: c.account_id,
+        signer: c.signer_address.to_string(),
+        funder: c.funder.to_string(),
+        token: c.access_token,
+    });
     let journal = Journal::open(Path::new(&settings.journal), &exchange.scope())?;
     let stopped = journal
         .orders
@@ -816,6 +928,8 @@ pub async fn serve(settings: Settings) -> Result<()> {
     let bind = settings.bind.clone();
     let max = settings.max_inflight;
     let app = Arc::new(App {
+        live,
+        history_notify: Notify::new(),
         settings,
         data: RwLock::new(Data {
             restore,
@@ -852,7 +966,7 @@ pub async fn serve(settings: Settings) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!(
         "{}",
-        json!({"mode":"shadow","execution":"loopback_mock_only","subscribed":"ober.*.best + UMA lifecycle"})
+        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"},"subscribed":"ober.*.best + UMA lifecycle"})
     );
     let shutdown = app.clone();
     axum::serve(listener, router)
@@ -915,6 +1029,8 @@ mod tests {
             std::env::temp_dir().join(format!("shadow-parity-{}-{now}.jsonl", std::process::id()));
         let journal = Journal::open(&path, &exchange.scope())?;
         let app = Arc::new(App {
+            live: None,
+            history_notify: Notify::new(),
             settings: Settings {
                 django_url: format!("{url}/context"),
                 history_url: format!("{url}/history"),

@@ -76,14 +76,16 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dry-run',action='store_true')
     parser.add_argument('--build-only',action='store_true')
+    parser.add_argument('--live-account',choices=['airdrop_224'])
     parser.add_argument('--registry-env')
     args=parser.parse_args()
+    mode='live' if args.live_account else 'shadow'
     sha=run(['git','-C',str(ROOT),'rev-parse','HEAD'],capture=True).decode().strip()
     branch=run(['git','-C',str(ROOT),'branch','--show-current'],capture=True).decode().strip()
     if not re.fullmatch(r'[a-f0-9]{40}',sha) or not branch: raise RuntimeError('build from an identified Git branch')
     if run(['git','-C',str(ROOT),'status','--porcelain'],capture=True).strip(): raise RuntimeError('commit changes first; deployment only archives a clean commit')
     image=f'{REPOSITORY}:{sha[:12]}'
-    log(f'branch={branch} revision={sha} | build=brahma | runtime=amster-p | mode=shadow')
+    log(f'branch={branch} revision={sha} | build=brahma | runtime=amster-p | mode={mode}')
     log(f'image={image} | project=polym-rust-demo | limits=0.5 CPU core / 256 MiB')
     if args.dry_run: return
     creds=credentials(args.registry_env)
@@ -109,9 +111,32 @@ sudo -n docker --config {shlex.quote(build)} push {shlex.quote(image)}
         if not pinned or not re.fullmatch(re.escape(REPOSITORY)+r'@sha256:[a-f0-9]{64}',pinned): raise RuntimeError('pushed digest unavailable')
         log(f'pushed={pinned}')
         if args.build_only: return
+        if args.live_account:
+            exists=remote('amster-p','sudo -n test -f /opt/polym-rust-demo/secrets/airdrop_224.json && echo yes || echo no',capture=True).decode().strip()
+            if exists!='yes':
+                log('amster-p: provision only the selected account credentials without sending them to the build host')
+                remote('amster-p','sudo -n docker exec -i polym_amster-web-1 python manage.py shell',data=(ROOT/'scripts/provision_live_credentials.py').read_bytes())
+                remote('amster-p','bash -s',data=b"""set -euo pipefail
+sudo -n install -d -m 0700 /opt/polym-rust-demo/secrets
+sudo -n docker cp polym_amster-web-1:/tmp/rust-live-account-224.json /opt/polym-rust-demo/secrets/airdrop_224.json
+sudo -n docker cp polym_amster-web-1:/tmp/rust-live-access-224.token /opt/polym-rust-demo/secrets/access.token
+sudo -n chown 10001:10001 /opt/polym-rust-demo/secrets/airdrop_224.json
+sudo -n chmod 0400 /opt/polym-rust-demo/secrets/airdrop_224.json /opt/polym-rust-demo/secrets/access.token
+sudo -n docker exec polym_amster-web-1 rm /tmp/rust-live-account-224.json /tmp/rust-live-access-224.token
+""")
+        if args.live_account:
+            remote('amster-p','sudo -n python3 -',data=b"""import json,os
+from pathlib import Path
+root=Path('/opt/polym-rust-demo/secrets')
+c=json.loads((root/'airdrop_224.json').read_text())
+assert c['account_name']=='airdrop_224'
+fd=os.open(root/'access.token',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o400)
+os.fchmod(fd,0o400)
+with os.fdopen(fd,'w') as f:f.write(c['access_token'])
+""")
         target=temp('amster-p');stages.append(('amster-p',target))
         remote('amster-p',f'umask 077; cat > {shlex.quote(target+"/config.json")}',data=creds)
-        remote('amster-p',f'cat > {shlex.quote(target+"/compose.yaml")}',data=(ROOT/'deploy/compose.yaml').read_bytes())
+        remote('amster-p',f'cat > {shlex.quote(target+"/compose.yaml")}',data=(ROOT/('deploy/compose.live.yaml' if args.live_account else 'deploy/compose.yaml')).read_bytes())
         remote('amster-p',f'cat > {shlex.quote(target+"/image.env")}',data=f'DEMO_IMAGE={pinned}\nSOURCE_SHA={sha}\n'.encode())
         release=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+sha[:12]
         log('amster-p: pull immutable image and update the isolated Compose service')
@@ -148,17 +173,21 @@ for _ in range(90):
     try:
         with urllib.request.urlopen("http://127.0.0.1:18787/health",timeout=5) as response:
             state=json.load(response)
-        if state.get("mode")=="shadow" and state.get("ready"):
+        if state.get("mode")=="@MODE@" and state.get("ready"):
             break
     except OSError:
         pass
     time.sleep(1)
 else:
-    raise SystemExit("shadow input/context readiness timed out")
+    raise SystemExit("input/account/context readiness timed out")
 READY
 }
 if ! verify; then
- echo 'ERROR new demo deployment failed verification' >&2
+ echo 'ERROR new deployment failed verification' >&2
+ if test @MODE@ = live; then
+  echo 'Live container retained for audit; do not silently roll back after possible real submission' >&2
+  exit 1
+ fi
  if test "$previous" = 1; then
   sudo -n cp "$root/releases/$release/previous.env" "$root/image.env"
   sudo -n cp "$root/releases/$release/previous-compose.yaml" "$root/compose.yaml"
@@ -169,7 +198,7 @@ if ! verify; then
 fi
 compose ps
 '''
-        for k,v in {'@STAGE@':target,'@IMAGE@':pinned,'@SHA@':sha,'@RELEASE@':release}.items(): script=script.replace(k,shlex.quote(v))
+        for k,v in {'@STAGE@':target,'@IMAGE@':pinned,'@SHA@':sha,'@RELEASE@':release,'@MODE@':mode}.items(): script=script.replace(k,shlex.quote(v))
         remote('amster-p','bash -s',data=script.encode())
         log('deployment verified; reading timings and resource usage')
         run([sys.executable,str(ROOT/'scripts/observe.py'),'--seconds','5'])

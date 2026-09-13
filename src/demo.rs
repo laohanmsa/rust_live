@@ -119,7 +119,10 @@ fn verify(headers: &HeaderMap, bytes: &[u8]) -> Result<String> {
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("bad signature type"))?
         .try_into()?;
-    ensure!(order.signatureType == 0, "demo uses EOA signatures");
+    ensure!(
+        [0, 2].contains(&order.signatureType),
+        "unsupported test signature type"
+    );
     order.timestamp = u("timestamp")?;
     order.metadata = o["metadata"].as_str().unwrap_or("").parse()?;
     order.builder = o["builder"].as_str().unwrap_or("").parse()?;
