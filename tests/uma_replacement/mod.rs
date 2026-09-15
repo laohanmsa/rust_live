@@ -105,6 +105,7 @@ enum Mode {
 struct Model {
     logs: Vec<Value>,
     mode: Mode,
+    head_timestamp: u64,
     seconds_per_block: u64,
     transactions: usize,
     calls: Mutex<Vec<(String, Value)>>,
@@ -112,7 +113,7 @@ struct Model {
 }
 impl Model {
     fn timestamp(&self, block: u64) -> u64 {
-        now_ms() / 1000 - HEAD.saturating_sub(block) * self.seconds_per_block
+        self.head_timestamp - HEAD.saturating_sub(block) * self.seconds_per_block
     }
     fn header(&self, block: u64) -> Value {
         let h = if matches!(self.mode, Mode::BadHeadAndUnavailableLogs) && block == HEAD {
@@ -200,6 +201,7 @@ impl Node {
         let model = Arc::new(Model {
             logs,
             mode,
+            head_timestamp: now_ms() / 1000,
             seconds_per_block: step,
             transactions,
             calls: Mutex::new(Vec::new()),
@@ -228,8 +230,7 @@ impl Node {
 async fn app(nodes: &[&Node], initialized: bool) -> Arc<App> {
     assert!(!nodes.is_empty());
     assert!(nodes.iter().all(|n| n.url.starts_with("http://127.0.0.1:")));
-    let nats_url = std::env::var("UMA_REPLACEMENT_NATS_URL")
-        .unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+    let nats_url = "nats://127.0.0.1:4222".to_owned();
     let nats = async_nats::connect(&nats_url)
         .await
         .expect("isolated NATS fixture is required");
@@ -287,10 +288,10 @@ fn compat_request_price() {
     let result = decode(&event, now_ms() / 1000);
     evidence(
         "COMPAT-01",
-        json!({"decoded":result.is_ok(),"subscribed":topics().contains(&RequestPrice::SIGNATURE_HASH.to_string())}),
+        json!({"decoded":matches!(&result, Ok(Some(_))),"subscribed":topics().contains(&RequestPrice::SIGNATURE_HASH.to_string())}),
     );
     assert!(
-        result.is_ok(),
+        matches!(&result, Ok(Some(_))),
         "RequestPrice must be decoded: {:?}",
         result.err()
     );
@@ -368,9 +369,7 @@ fn decoder_recorded_chain_samples() {
 async fn compat_legacy_redis_delivery() {
     let node = Node::start(Mode::Good, vec![], 1, 0).await;
     let app = app(&[&node], true).await;
-    let redis_url = std::env::var("UMA_REPLACEMENT_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let mut sub = redis::Client::open(redis_url)
+    let mut sub = redis::Client::open("redis://127.0.0.1:6379")
         .unwrap()
         .get_async_pubsub()
         .await
@@ -425,6 +424,38 @@ async fn duplicate_is_published_once() {
     assert_eq!(rows.len(), 1);
     assert_eq!(app.feed.read().await.sequence, 1);
     evidence("STATE-01", json!({"publications":rows.len()}));
+}
+
+#[test]
+#[ignore = "replacement acceptance gate"]
+fn legacy_bridge_has_required_event_data() {
+    // Legacy format_decoded_event requires data that a transport-only bridge cannot invent.
+    // Receipt time and normalized prices can be converted, so they are not missing-data gates.
+    let mut missing = Vec::new();
+    for kind in ["propose", "dispute", "settle"] {
+        let e = decode(
+            &fixture(kind, ORACLES[0], requesters(ORACLES[0])[0], 999, 1),
+            now_ms() / 1000,
+        )
+        .unwrap()
+        .unwrap();
+        let value = serde_json::to_value(e).unwrap();
+        let extra: &[&str] = match kind {
+            "propose" => &["expiration_timestamp", "currency"],
+            "dispute" => &["proposer", "disputer"],
+            _ => &["proposer", "disputer", "payout"],
+        };
+        for key in ["requester", "identifier_hex", "ancillary_data"]
+            .iter()
+            .chain(extra)
+        {
+            if value[*key].is_null() {
+                missing.push(format!("{kind}.{key}"));
+            }
+        }
+    }
+    evidence("COMPAT-03", json!({"missing_fields":missing}));
+    assert!(missing.is_empty(), "legacy event data lost: {missing:?}");
 }
 
 #[tokio::test]
@@ -606,7 +637,7 @@ async fn long_gap_must_replay_events_older_than_trading_window() {
     let mut sub = app.nats.subscribe(SUBJECT).await.unwrap();
     app.nats.flush().await.unwrap();
     let worker = tokio::spawn(app.clone().scan_loop());
-    for _ in 0..100 {
+    for _ in 0..500 {
         if app.feed.read().await.initialized {
             break;
         }
