@@ -265,6 +265,7 @@ pub struct OrderSizing {
     pub standard: Decimal,
     pub below_005: Decimal,
     pub below_080: Decimal,
+    pub through_098: Decimal,
     pub at_099_low_depth: Decimal,
 }
 
@@ -468,7 +469,9 @@ pub fn decide(
             sizing.below_005
         } else if price < d("0.80") {
             sizing.below_080
-        } else if price == d("0.99") && depth < d("50") {
+        } else if price <= d("0.98") {
+            sizing.through_098
+        } else if price == d("0.99") && depth < d("51") {
             sizing.at_099_low_depth
         } else {
             sizing.standard

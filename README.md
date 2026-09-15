@@ -308,7 +308,7 @@ OBer best 接口拒绝未同步或被隔离的盘口，获取失败时跳过。
 首次实盘部署会做该账户的链上现金与授权只读检查，并使用现有方式获取交易 API 凭据。
 账户继续可供旧应用使用，不做独占分配。
 
-实盘每笔最多 30 pUSD（平台美元代币），具体预算按独立配置中的 5 / 20 档位计算，每市场沿用当前次数上限。
+实盘每笔最多 30 pUSD（平台美元代币），具体预算按独立配置中的 5 / 10 / 20 档位计算，每市场沿用当前次数上限。
 按用户 2026-09-14 指示取消实盘累计额度限制，`deploy/live.json` 的 `total_budget_pusd: null` 表示不限制累计金额。
 日志仍持续记录累计预留金额，包括拒绝或不明请求，不能把它当作实际花费。
 模拟配置仍有累计额度限制；单笔额度、余额检查、信号寿命和不明提交暂停规则不变。
@@ -400,7 +400,7 @@ bash tests/uma_replacement/run-brahma.sh
 ## Rust live sizing and million-order journal (2026-09-15)
 
 `deploy/live.json` now owns the independent live sizing bands through `order_sizing`.
-Prices below 0.05 use 5 pUSD; prices from 0.05 inclusive to 0.80 exclusive use 20; exactly 0.99 with fewer than 50 shares across the first five asks uses 20; all other eligible prices use 5.
+Prices below 0.05 use 5 pUSD; prices from 0.05 inclusive to 0.80 exclusive use 20; prices from 0.80 through 0.98 inclusive use 10; exactly 0.99 with fewer than 51 shares across the first five asks uses 20; all other eligible prices use 5.
 The live per-order cap is 30, and the cumulative budget remains unlimited.
 The ordinary 5-unit band and all non-sizing guards remain unchanged.
 Django shared strategy amounts are not modified; shadow configurations without an override continue using the previous policy.

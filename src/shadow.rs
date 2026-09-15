@@ -87,6 +87,7 @@ impl Settings {
                     sizing.standard,
                     sizing.below_005,
                     sizing.below_080,
+                    sizing.through_098,
                     sizing.at_099_low_depth
                 ]
                 .iter()
@@ -1251,6 +1252,7 @@ mod tests {
                             standard: Decimal::from(5),
                             below_005: Decimal::from(5),
                             below_080: Decimal::from(20),
+                            through_098: Decimal::from(10),
                             at_099_low_depth: Decimal::from(20),
                         })
                     } else {

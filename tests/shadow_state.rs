@@ -228,7 +228,7 @@ fn live_sizing_uses_approved_bands_and_keeps_liquidity_and_fee_checks() -> anyho
         "strategy_enabled":true,"max_ask_price":"0.999","max_orders_per_market":1,
         "ev_threshold":"0.0002","order_size_usd":"5","low_price_order_size_usd":"10",
         "low_depth_099_order_size_usd":"10","order_sizing":{
-        "standard":"5","below_005":"5","below_080":"20","at_099_low_depth":"20"}
+        "standard":"5","below_005":"5","below_080":"20","through_098":"10","at_099_low_depth":"20"}
     }))?;
     let mut life = Lifecycle::default();
     life.seed("m", context.resolution.as_ref().unwrap());
@@ -237,9 +237,13 @@ fn live_sizing_uses_approved_bands_and_keeps_liquidity_and_fee_checks() -> anyho
         ("0.05", "1000", "20", "400"),
         ("0.50", "100", "20", "40"),
         ("0.799", "100", "20", "25"),
-        ("0.80", "100", "5", "6"),
+        ("0.80", "100", "10", "12"),
+        ("0.98", "100", "10", "10"),
+        ("0.981", "100", "5", "5"),
         ("0.99", "49", "20", "20"),
-        ("0.99", "50", "5", "5"),
+        ("0.99", "50", "20", "20"),
+        ("0.99", "50.999", "20", "20"),
+        ("0.99", "51", "5", "5"),
         ("0.999", "50", "5", "5"),
     ] {
         let book = json!({"token_id":"1","best_ask":{"price":price,"size":depth},
