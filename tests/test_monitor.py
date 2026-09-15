@@ -2,7 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from monitor import issues, transitions, delivered
+from monitor import issues, transitions, delivered, ssh_command
 
 class MonitorTest(unittest.TestCase):
     def snapshot(self):
@@ -33,6 +33,15 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(transitions(state,found,1045),alarm) # Not marked sent before acknowledgement.
         delivered(state,alarm,1045)
         self.assertEqual(transitions(state,found,1060),[])
+
+    def test_relay_keeps_host_verification_and_rejects_shell_text(self):
+        config={'ssh_target':'root@95.179.181.132','ssh_relay':'root@70.34.203.243'}
+        command=ssh_command(config)
+        proxy=next(v for v in command if v.startswith('ProxyCommand='))
+        self.assertIn('StrictHostKeyChecking=yes',proxy)
+        self.assertEqual(command[-1],config['ssh_target'])
+        config['ssh_relay']='root@70.34.203.243; echo unsafe'
+        with self.assertRaises(ValueError):ssh_command(config)
 
     def test_stale_uma_and_unknown_orders_are_detected(self):
         s=self.snapshot();s['uma']['scan_age_ms']=11000

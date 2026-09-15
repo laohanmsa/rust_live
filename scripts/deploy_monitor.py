@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shlex
 import subprocess
+import time
 from deploy import ROOT, REPOSITORY, credentials, remote, run, temp
 
 
@@ -28,13 +29,21 @@ def main():
     if line not in existing.splitlines():
         remote('amster-p','umask 077; cat >> /root/.ssh/authorized_keys; chmod 0600 /root/.ssh/authorized_keys',data=('\n'+line+'\n').encode())
 
+    # Stockholm is already in MP's allowlist. The relay key can only connect to MP:22.
+    if remote('stockholm','command -v nc',capture=True).strip()!=b'/usr/bin/nc':
+        raise RuntimeError('restricted relay requires the existing nc utility')
+    relay_line='restrict,command="/usr/bin/nc -w 10 95.179.181.132 22" '+pub
+    existing=remote('stockholm','cat /root/.ssh/authorized_keys',capture=True).decode()
+    if relay_line not in existing.splitlines():
+        remote('stockholm','umask 077; cat >> /root/.ssh/authorized_keys; chmod 0600 /root/.ssh/authorized_keys',data=('\n'+relay_line+'\n').encode())
+    relay_key=remote('stockholm','cat /etc/ssh/ssh_host_ed25519_key.pub',capture=True).decode().split()
     host_key=remote('amster-p','cat /etc/ssh/ssh_host_ed25519_key.pub',capture=True).decode().split()
-    remote('brahma',f'cat > {root}/secrets/known_hosts; chmod 0600 {root}/secrets/known_hosts',data=('95.179.181.132 '+' '.join(host_key[:2])+'\n').encode())
+    remote('brahma',f'cat > {root}/secrets/known_hosts; chmod 0600 {root}/secrets/known_hosts',data=('95.179.181.132 '+' '.join(host_key[:2])+'\n70.34.203.243 '+' '.join(relay_key[:2])+'\n').encode())
     # Only the notification token and the user's existing destination leave MP, never trading credentials.
     script="""import json,subprocess
 row=json.loads(subprocess.check_output(['docker','inspect','polym_amster-web-1']))[0]
 e=dict(item.split('=',1) for item in row['Config']['Env'] if '=' in item)
-c={'pushover_app_token':e.get('PUSHOVER_APP_TOKEN',''),'pushover_user_key':e.get('PUSHOVER_USER_KEY',''),'ssh_target':'root@95.179.181.132'}
+c={'pushover_app_token':e.get('PUSHOVER_APP_TOKEN',''),'pushover_user_key':e.get('PUSHOVER_USER_KEY',''),'ssh_target':'root@95.179.181.132','ssh_relay':'root@70.34.203.243'}
 assert len(c['pushover_app_token'])>=20 and len(c['pushover_user_key'])>=20,'Pushover credentials unavailable'
 print(json.dumps(c))
 """
@@ -56,6 +65,13 @@ print(json.dumps(c))
             'logging':{'driver':'json-file','options':{'max-size':'5m','max-file':'2'}}}}}
         remote('brahma',f'cat > {root}/compose.json',data=json.dumps(compose).encode())
         remote('brahma',f'sudo -n docker compose -f {root}/compose.json up -d --wait --wait-timeout 120')
+        for _ in range(20):
+            snapshot=json.loads(remote('brahma',f'cat {root}/state/last-snapshot.json',capture=True))
+            if snapshot.get('schema_version')==1 and abs(time.time()*1000-snapshot.get('captured_at_ms',0))<30000:
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError('monitor is running but cannot read a fresh MP snapshot')
         result=remote('brahma',f'cat {root}/state/heartbeat.json',capture=True)
         print('Brahma monitor running: '+result.decode().strip())
     finally:

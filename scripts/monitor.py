@@ -2,6 +2,8 @@
 """Read-only off-host monitor. Incident detection, durable dedupe and Pushover delivery."""
 import argparse
 import json
+import ipaddress
+import shlex
 import os
 from pathlib import Path
 import subprocess
@@ -102,10 +104,22 @@ def push(config, title, message, priority=0):
         raise RuntimeError('Pushover did not acknowledge delivery')
 
 
-def read_snapshot(config):
-    command=['ssh','-T','-i','/run/secrets/monitor_key','-o','BatchMode=yes','-o','IdentitiesOnly=yes',
+def ssh_command(config):
+    base=['ssh','-T','-i','/run/secrets/monitor_key','-o','BatchMode=yes','-o','IdentitiesOnly=yes',
         '-o','StrictHostKeyChecking=yes','-o','UserKnownHostsFile=/run/secrets/known_hosts',
-        '-o','ConnectTimeout=5','-o','ServerAliveInterval=5','-o','ServerAliveCountMax=1',config['ssh_target']]
+        '-o','ConnectTimeout=5','-o','ServerAliveInterval=5','-o','ServerAliveCountMax=1']
+    command=list(base)
+    relay=config.get('ssh_relay')
+    if relay:
+        user,host=relay.split('@',1)
+        if user!='root':raise ValueError('unsupported relay user')
+        ipaddress.IPv4Address(host)
+        command.extend(['-o','ProxyCommand='+shlex.join(base+[relay])])
+    return command+[config['ssh_target']]
+
+
+def read_snapshot(config):
+    command=ssh_command(config)
     try:
         result=subprocess.run(command,capture_output=True,timeout=15,check=True)
         if len(result.stdout)>1024*1024:
