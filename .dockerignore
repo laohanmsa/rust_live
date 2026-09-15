@@ -8,3 +8,6 @@
 !deploy/shadow.json
 
 !deploy/live.json
+
+!scripts/
+!scripts/monitor.py
