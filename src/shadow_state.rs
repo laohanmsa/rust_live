@@ -28,6 +28,22 @@ pub struct Lifecycle {
     pub needs_refresh: HashSet<String>,
 }
 impl Lifecycle {
+    pub fn prune_inactive(&mut self, active: &HashSet<String>, now: u64) -> usize {
+        let before = self.marks.len();
+        self.marks.retain(|market, mark| {
+            active.contains(market)
+                || now.saturating_sub(mark.received_ms) < 10_800_000
+                || self.disputes.get(market).is_some_and(|d| !d.is_empty())
+        });
+        self.needs_refresh
+            .retain(|market| self.marks.contains_key(market));
+        // Keep terminal proofs: evicting a cache entry must not revive a late proposal.
+        before - self.marks.len()
+    }
+    pub fn terminal_proof_count(&self) -> usize {
+        self.terminals.len()
+    }
+
     pub fn apply(&mut self, channel: &str, value: &Value) -> bool {
         let Some(market) = value["market_id"].as_str().filter(|s| !s.is_empty()) else {
             return false;
@@ -145,6 +161,17 @@ impl Lifecycle {
         } else {
             &resolution.status
         };
+        if status == "proposed" {
+            let prefix = format!(
+                "{market}/{}/",
+                resolution.request_id.as_deref().unwrap_or("")
+            );
+            if self.terminals.iter().any(|(key, (terminal_block, _, _))| {
+                key.starts_with(&prefix) && *terminal_block >= block
+            }) {
+                return;
+            }
+        }
         self.marks.insert(
             market.into(),
             Mark {

@@ -92,7 +92,14 @@ struct Data {
     clocks: BTreeMap<String, u64>,
     history_error: String,
     live_ready_at_ms: u64,
+    lifecycle_pruned: u64,
     rejections: VecDeque<Value>,
+}
+impl Data {
+    fn prune_lifecycle(&mut self) {
+        let active = self.markets.keys().cloned().collect();
+        self.lifecycle_pruned += self.lifecycle.prune_inactive(&active, now_ms()) as u64;
+    }
 }
 struct LiveAccount {
     name: String,
@@ -116,10 +123,23 @@ struct App {
     redis_up: AtomicBool,
     redis_epoch: AtomicU64,
     stopped: AtomicBool,
+    stop_reason: std::sync::Mutex<Option<&'static str>>,
     boot_at_ms: u64,
     http: reqwest::Client,
 }
 impl App {
+    fn halt(&self, reason: &'static str) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let mut stored = self.stop_reason.lock().expect("stop reason mutex");
+        if stored.is_none() {
+            *stored = Some(reason);
+            println!(
+                "{}",
+                json!({"event":"trading_stopped","reason":reason,"at_ms":now_ms()})
+            );
+        }
+    }
+
     fn access_token(&self) -> &str {
         self.live
             .as_ref()
@@ -314,6 +334,7 @@ impl App {
                             && epoch == self.redis_epoch.load(Ordering::SeqCst)
                             && self.redis_up.load(Ordering::SeqCst)
                         {
+                            data.prune_lifecycle();
                             data.synced_epoch = Some(epoch);
                             data.last_sync_ms = now_ms();
                             last_full = Instant::now();
@@ -361,7 +382,10 @@ impl App {
             *data.uma_counts.entry(channel.into()).or_default() += 1;
             data.last_uma_ms = now_ms();
             if data.lifecycle.marks.len() > 20000 {
-                self.stopped.store(true, Ordering::SeqCst);
+                data.prune_lifecycle();
+            }
+            if data.lifecycle.marks.len() > 20000 {
+                self.halt("lifecycle_capacity");
                 data.context_error = "lifecycle_capacity".into();
                 continue;
             }
@@ -746,7 +770,7 @@ impl App {
             _ => {
                 r.state = "blocked".into();
                 r.reason = "shadow_journal_or_budget_limit".into();
-                self.stopped.store(true, Ordering::SeqCst);
+                self.halt("shadow_journal_or_budget_limit");
                 return r;
             }
         }
@@ -781,8 +805,10 @@ impl App {
             match tokio::time::timeout(Duration::from_secs(5), self.exchange.post(signed)).await {
                 Ok(Ok((status, body))) if self.live.is_some() => {
                     crate::apply_exchange_response(&mut r, status, &body);
-                    if r.state == "unknown" || [401, 403].contains(&status) {
-                        self.stopped.store(true, Ordering::SeqCst);
+                    if r.state == "unknown" {
+                        self.halt("submission_uncertain");
+                    } else if [401, 403].contains(&status) {
+                        self.halt("exchange_auth_rejected");
                     }
                 }
                 Ok(Ok((200, body)))
@@ -795,7 +821,7 @@ impl App {
                 _ => {
                     r.state = "unknown".into();
                     r.reason = "submission_uncertain".into();
-                    self.stopped.store(true, Ordering::SeqCst);
+                    self.halt("submission_uncertain");
                 }
             }
             r.post_ms = Some(elapsed_ms(started));
@@ -810,7 +836,7 @@ impl App {
         ) {
             r.state = "unknown".into();
             r.reason = "shadow_result_record_failed".into();
-            self.stopped.store(true, Ordering::SeqCst);
+            self.halt("shadow_result_record_failed");
         }
         r.finalize_ms = Some(elapsed_ms(started));
         self.history_notify.notify_one();
@@ -824,7 +850,7 @@ struct Window {
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     let data = app.data.read().await;
     Json(
-        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"data_sources":"Django + UMA + OBer","execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
+        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"stop_reason":*app.stop_reason.lock().expect("stop reason mutex"),"data_sources":"Django + UMA + OBer","execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
     )
 }
 async fn metrics(
@@ -846,6 +872,9 @@ async fn metrics(
     result["mode"] = json!(app.exchange.mode());
     result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"valuation_mode":"local_m5","valuation_inputs":data.markets.values().filter(|c|c.market_volume.is_some()&&c.event_volume.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
     result["sources"]["recent_rejections"] = json!(data.rejections);
+    result["sources"]["lifecycle_marks"] = json!(data.lifecycle.marks.len());
+    result["sources"]["lifecycle_pruned"] = json!(data.lifecycle_pruned);
+    result["sources"]["lifecycle_terminal_proofs"] = json!(data.lifecycle.terminal_proof_count());
     let history_error = data.history_error.clone();
     drop(data);
     let ledger = app.journal.lock().await;
@@ -870,7 +899,7 @@ async fn stop(State(app): State<Arc<App>>, headers: HeaderMap) -> StatusCode {
     if !authorized(&headers, app.access_token()) {
         return StatusCode::UNAUTHORIZED;
     }
-    app.stopped.store(true, Ordering::SeqCst);
+    app.halt("manual_stop");
     StatusCode::OK
 }
 
@@ -945,6 +974,7 @@ async fn serve_inner(
         redis_up: AtomicBool::new(false),
         redis_epoch: AtomicU64::new(0),
         stopped: AtomicBool::new(stopped),
+        stop_reason: std::sync::Mutex::new(stopped.then_some("unconfirmed_journal")),
         boot_at_ms: now_ms(),
         http: reqwest::Client::builder()
             .no_proxy()
@@ -979,7 +1009,7 @@ async fn serve_inner(
             } else {
                 let _ = tokio::signal::ctrl_c().await;
             }
-            shutdown.stopped.store(true, Ordering::SeqCst);
+            shutdown.halt("shutdown");
         })
         .await?;
     for task in tasks {
@@ -1060,6 +1090,7 @@ mod tests {
             redis_up: AtomicBool::new(true),
             redis_epoch: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
+            stop_reason: std::sync::Mutex::new(None),
             boot_at_ms: now,
             http: reqwest::Client::new(),
         });
@@ -1114,6 +1145,12 @@ mod tests {
             app.data.read().await.rejections.back().unwrap()["reason"],
             "not_proposed_or_lifecycle_changed"
         );
+        app.halt("lifecycle_capacity");
+        app.data.write().await.context_error.clear();
+        app.halt("manual_stop");
+        let state = health(State(app.clone())).await.0;
+        assert_eq!(state["ready"], false);
+        assert_eq!(state["stop_reason"], "lifecycle_capacity");
         server.abort();
         drop(app);
         std::fs::remove_file(path.with_extension("history-acks.jsonl"))?;

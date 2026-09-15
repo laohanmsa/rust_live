@@ -112,6 +112,7 @@ def collect(args):
 def render(data):
     m, r, limits = data['metrics'], data['resources'], data['limits']
     print(f"{data['host']} | {data['mode']} | ready={data['health']['ready']} | revision={data['revision'][:12]}")
+    print(f"Trading stopped: {data['health']['stopped']} | reason: {data['health'].get('stop_reason') or '-'}")
     print(f"Resource sample: {r['seconds']}s, {r['samples']} samples")
     print(f"CPU: average {r['cpu_percent_of_one_core_avg']}%, max {r['cpu_percent_of_one_core_max']}% of one core; limit {limits['cpu_cores']} core")
     print(f"Memory: average {r['memory_mib_avg']:.2f} MiB, max {r['memory_mib_max']:.2f} MiB; limit {limits['memory_mib']} MiB; processes/threads max {r['pids_max']}")

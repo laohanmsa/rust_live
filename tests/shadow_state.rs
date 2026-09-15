@@ -124,3 +124,48 @@ fn changed_proposal_price_invalidates_the_prepared_winner() {
     life.apply("uma:resolution", &second);
     assert!(!life.matches_proposal("m", "r", 10, "1".parse().unwrap()));
 }
+
+#[test]
+fn lifecycle_pruning_keeps_current_markets_and_terminal_proofs() {
+    use polym_rust_demo::shadow_state::Resolution;
+    use std::collections::HashSet;
+    let mut life = Lifecycle::default();
+    for i in 0..20_001 {
+        let event = json!({"market_id":format!("old-{i}"),"request_id":"r","request_timestamp":100,
+            "oracle_address":"o","block_number":11,"log_index":1});
+        life.apply("uma:settle", &event);
+        life.marks.get_mut(&format!("old-{i}")).unwrap().received_ms = 1;
+    }
+    let event = |market: &str, block| {
+        json!({"market_id":market,"request_id":"r","request_timestamp":100,
+        "oracle_address":"o","block_number":block,"log_index":1,"proposed_price":1})
+    };
+    life.apply("uma:resolution", &event("active", 10));
+    life.marks.get_mut("active").unwrap().received_ms = 1;
+    life.apply("uma:dispute_price", &event("disputed", 11));
+    life.marks.get_mut("disputed").unwrap().received_ms = 1;
+    life.apply("uma:resolution", &event("recent", 10));
+    let now = polym_rust_demo::now_ms();
+    life.marks.get_mut("recent").unwrap().received_ms = now;
+    assert_eq!(
+        life.prune_inactive(&HashSet::from(["active".into()]), now),
+        20_001
+    );
+    assert_eq!(life.marks.len(), 3);
+    assert!(life.is_proposed("active", "r", 10));
+    assert!(life.is_proposed("recent", "r", 10));
+    assert!(life.has_dispute("disputed"));
+    assert!(!life.needs_refresh.contains("old-0"));
+    assert!(!life.apply("uma:resolution", &event("old-0", 10)));
+    let stale: Resolution =
+        serde_json::from_value(json!({"id":1,"request_id":"r","status":"proposed",
+        "proposed_price":"1","propose_time_ms":1,"block_number":10,"dispute_block_number":null,
+        "settle_block_number":null,"disputed":false,"settled":false}))
+        .unwrap();
+    life.seed("old-0", &stale);
+    assert!(!life.is_proposed("old-0", "r", 10));
+    let mut fresh = stale;
+    fresh.block_number = Some(20);
+    life.seed("old-0", &fresh);
+    assert!(life.is_proposed("old-0", "r", 20));
+}
