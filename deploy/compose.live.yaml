@@ -18,8 +18,8 @@ services:
       - /tmp:size=16m,mode=1777
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    cpus: 0.50
-    mem_limit: 256m
+    cpus: 2.0
+    mem_limit: 4g
     pids_limit: 64
     restart: unless-stopped
     stop_grace_period: 15s
