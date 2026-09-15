@@ -808,3 +808,8 @@ mod tests {
         assert_eq!(f.pruned, 25_000);
     }
 }
+
+// Test-only replacement gates. No code in this module enters production builds.
+#[cfg(test)]
+#[path = "../tests/uma_replacement/mod.rs"]
+mod replacement_tests;

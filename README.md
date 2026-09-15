@@ -372,3 +372,25 @@ MP 本机 `18788/health` 提供 UMA 诊断数据，`18788/ready` 只有在数据
 监控自身所在的 Brahma 整机不可用时无法自行发送告警，这需要另一台外部探测器。
 
 Pushover 通知格式参考[官方消息接口](https://pushover.net/api)，事件解码使用[Alloy 的类型化事件接口](https://docs.rs/alloy-sol-types/latest/alloy_sol_types/trait.SolEvent.html)。
+
+## UMA 替换门槛测试
+
+替换测试位于 `tests/uma_replacement/`，只使用回环 RPC、固定链上日志和可选的隔离 NATS（消息总线）及 Redis（内存数据库）。
+它们不读取账户凭据，不向交易所发单，也不连接生产服务。
+
+普通测试：
+
+```sh
+cargo test --locked --lib --tests
+```
+
+替换门槛测试需要测试环境提供 NATS（默认 `nats://127.0.0.1:4222`），可以用 `UMA_REPLACEMENT_NATS_URL` 指定隔离地址；Redis 兼容测试可以用 `UMA_REPLACEMENT_REDIS_URL` 指定隔离地址：
+
+```sh
+UMA_REPLACEMENT_NATS_URL=nats://127.0.0.1:4222 \
+UMA_REPLACEMENT_REDIS_URL=redis://127.0.0.1:6379 \
+cargo test --locked --lib uma::replacement_tests -- --ignored --nocapture
+```
+
+测试覆盖四类事件、全部已支持适配器、真实事件夹具、字段兼容、重复和乱序、争议与结算终态、节点限流、空响应、节点分歧、重组、WebSocket（网页套接字）断线、长时间缺口恢复和重复扫描开销。
+失败结果分为代码缺口、测试基础设施不可用和真实数据不一致三类，不把缺少测试服务误报成链上数据正确。
