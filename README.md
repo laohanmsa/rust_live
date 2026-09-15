@@ -356,7 +356,7 @@ Django 继续提供市场信息、标签、费率、策略参数以及额外的�
 OBer 仍是共享的订单信号来源；本次没有重写 OBer 或旧应用的市场订阅流程。
 交易参数、每单额度、同市场次数限制及未知提交保护保持不变。
 
-`./observe.sh --json` 包含 `sources.uma_source`、`sources.native_uma`、账户就绪年龄、日志容量和未知订单数。
+`./observe.sh --json` 包含 `sources.uma_source`、`sources.native_uma`、账户就绪年龄、日志容量和未知订单数，并汇总 Brahma 监控状态及两个运行服务的资源快照。
 MP 本机 `18788/health` 提供 UMA 诊断数据，`18788/ready` 只有在数据可用时才成功。
 交易容器的就绪检查也使用 `/ready`，不再把进程存活当作交易就绪。
 

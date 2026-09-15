@@ -109,6 +109,23 @@ def collect(args):
     return result
 
 
+
+def read_monitor():
+    code = """import json,subprocess
+from pathlib import Path
+root=Path('/home/anchen/ops/rust-224-monitor/state')
+status=json.loads((root/'heartbeat.json').read_text())
+snapshot=json.loads((root/'last-snapshot.json').read_text())
+resource=json.loads(subprocess.check_output(['sudo','-n','docker','stats','--no-stream','--format','{{json .}}','rust-224-monitor-monitor-1'],timeout=5))
+print(json.dumps({'status':status,'snapshot_at_ms':snapshot.get('captured_at_ms'),'mp_resources':snapshot.get('resources',[]),'monitor_resource':resource}))
+"""
+    try:
+        result=subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=5','brahma','python3 -'],input=code,text=True,capture_output=True,timeout=12,check=True)
+        return json.loads(result.stdout)
+    except Exception as error:
+        return {'error':type(error).__name__}
+
+
 def render(data):
     m, r, limits = data['metrics'], data['resources'], data['limits']
     print(f"{data['host']} | {data['mode']} | ready={data['health']['ready']} | revision={data['revision'][:12]}")
@@ -119,6 +136,11 @@ def render(data):
     print(f"Journal: {r['journal_bytes']} bytes | restarts: {data['restarts']} | network/disk are cumulative container counters")
     print(f"Since boot: received={m['received']}, completed={m['completed']}, replayed={m['replayed']}; queue={m['queued']}, active={m['active']}")
     print(f"Observation window: {m['window_seconds']}s; retained={m['window_samples']}/{m['sample_capacity']}; truncated={m['window_truncated']}")
+    if data.get('monitoring'):
+        support=data['monitoring']
+        print('Brahma monitor: '+json.dumps(support.get('status',support)))
+        for row in [*support.get('mp_resources',[]),support.get('monitor_resource',{})]:
+            if row:print(f"{row['Name']}: CPU {row['CPUPerc']}, memory {row['MemUsage']} (support-service snapshot)")
     if m.get('history'):
         print('Dashboard order history: '+json.dumps(m['history']))
     if m.get('sources'):
@@ -156,6 +178,8 @@ def main():
         if run.returncode:
             raise RuntimeError(run.stderr.strip() or 'remote observation failed')
         data=json.loads(run.stdout)
+        if args.host=='amster-p' and data.get('mode')=='live':
+            data['monitoring']=read_monitor()
     if args.json: print(json.dumps(data,indent=2))
     else: render(data)
 
