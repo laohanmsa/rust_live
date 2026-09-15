@@ -90,10 +90,6 @@ impl Journal {
             }
             line += 1;
             ensure!(
-                line <= 2 * ORDER_CAPACITY + 1,
-                "journal record capacity reached"
-            );
-            ensure!(
                 buf.ends_with('\n'),
                 "incomplete journal record; inspect before restarting"
             );
@@ -193,12 +189,9 @@ impl Journal {
         Ok(())
     }
     fn index_result(index: &Connection, reply: &Reply, offset: u64, length: usize) -> Result<()> {
-        let changed = index.prepare_cached("UPDATE orders SET result_offset=?2,result_len=?3,state=?4,pending=(?5 AND NOT exported) WHERE id=?1 AND result_offset IS NULL")?
+        let changed = index.prepare_cached("UPDATE orders SET result_offset=?2,result_len=?3,state=?4,pending=(?5 AND NOT exported) WHERE id=?1")?
             .execute(params![reply.id,i64::try_from(offset)?,i64::try_from(length)?,reply.state,Self::pending(&reply.id,&reply.state)])?;
-        ensure!(
-            changed == 1,
-            "result without preparation or duplicate final result"
-        );
+        ensure!(changed == 1, "result without preparation");
         Ok(())
     }
     fn record(&self, offset: u64, length: usize) -> Result<Record> {
@@ -324,16 +317,11 @@ impl Journal {
     pub fn finish(&mut self, reply: Reply) -> Result<()> {
         let unfinished: Option<bool> = self
             .index
-            .query_row(
-                "SELECT result_offset IS NULL FROM orders WHERE id=?1",
-                [&reply.id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT 1 FROM orders WHERE id=?1", [&reply.id], |r| {
+                r.get(0)
+            })
             .optional()?;
-        ensure!(
-            unfinished == Some(true),
-            "result without preparation or duplicate final result"
-        );
+        ensure!(unfinished == Some(true), "result without preparation");
         let (offset, length) = self.append(&Record::Result {
             reply: reply.clone(),
         })?;

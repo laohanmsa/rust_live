@@ -409,7 +409,8 @@ The balance/readiness poll now also requires `trade_capacity_pusd` to cover the 
 Deploy the Dashboard receipt/capacity endpoint change before this client; a missing capacity field blocks new live orders.
 This remains a periodic readiness check, not a shared concurrent funds reservation.
 
-The journal allows 1,000,000 unique preparations, with at most one final result each.
+The journal allows 1,000,000 unique preparations.
+Later result corrections for the same preparation are replayed in file order, matching the legacy journal, and do not consume another order or another budget reservation.
 Original JSONL order and acknowledgement files remain authoritative and are not converted, deleted, or truncated.
 A restricted `*.index.sqlite` file holds record offsets and indexes for deduplication, pending history, unresolved submissions, and recent orders.
 The derived index is rebuilt from the authoritative files at every startup with an 8 MiB SQLite page cache; full old order payloads are no longer kept in memory.

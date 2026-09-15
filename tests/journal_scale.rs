@@ -95,3 +95,56 @@ fn legacy_log_recovers_past_old_capacity_without_losing_dedup_or_pending() -> Re
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[test]
+fn legacy_unknown_result_can_be_corrected_without_a_second_preparation() -> Result<()> {
+    let path = std::env::temp_dir().join(format!(
+        "rust-corrected-result-{}-{}.jsonl",
+        std::process::id(),
+        polym_rust_demo::now_ms()
+    ));
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    let mut writer = BufWriter::new(file);
+    let signal = demo::signal("live-corrected");
+    let reply: Reply = serde_json::from_value(
+        json!({"id":signal.id,"state":"prepared","reason":"","queue_ms":0,"sign_ms":0,"journal_ms":0,"total_ms":0}),
+    )?;
+    let entry = Stored {
+        signal,
+        reserved: "5".parse()?,
+        order: json!({}),
+        reply,
+    };
+    writeln!(
+        writer,
+        "{}",
+        json!({"kind":"Scope","scope":"live:synthetic"})
+    )?;
+    writeln!(writer, "{}", json!({"kind":"Prepared","entry":entry}))?;
+    for state in ["unknown", "rejected"] {
+        let mut reply = entry.reply.clone();
+        reply.state = state.into();
+        reply.reason = "verified correction".into();
+        writeln!(writer, "{}", json!({"kind":"Result","reply":reply}))?;
+    }
+    writer.flush()?;
+    drop(writer);
+    let mut journal = Journal::open(&path, "live:synthetic")?;
+    assert_eq!(journal.count, 1);
+    assert_eq!(journal.used, "5".parse()?);
+    assert_eq!(journal.unresolved_count()?, 0);
+    assert_eq!(journal.prepare(entry, None)?.unwrap().state, "rejected");
+    drop(journal);
+    for p in [
+        &path,
+        &path.with_extension("history-acks.jsonl"),
+        &path.with_extension("index.sqlite"),
+    ] {
+        std::fs::remove_file(p)?;
+    }
+    Ok(())
+}
