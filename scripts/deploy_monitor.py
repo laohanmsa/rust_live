@@ -58,8 +58,8 @@ print(json.dumps(c))
         remote('brahma',f'sudo -n docker --config {stage} push {image}')
         digests=json.loads(remote('brahma',shlex.join(['sudo','-n','docker','image','inspect',image,'--format','{{json .RepoDigests}}']),capture=True))
         pinned=next(d for d in digests if d.startswith(REPOSITORY+'-monitor@sha256:'))
-        compose={'name':'rust-224-monitor','services':{'monitor':{'image':pinned,'restart':'unless-stopped','user':'1000:1000','read_only':True,'tmpfs':['/tmp:size=8m'],
-            'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'cpus':.1,'mem_limit':'96m','pids_limit':32,
+        compose={'name':'rust-224-monitor','services':{'monitor':{'image':pinned,'restart':'unless-stopped','user':'1000:1000','init':True,'read_only':True,'tmpfs':['/tmp:size=8m'],
+            'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],'cpus':.25,'mem_limit':'96m','pids_limit':32,
             'volumes':[root+'/state:/state',root+'/secrets/id_ed25519:/run/secrets/monitor_key:ro',root+'/secrets/known_hosts:/run/secrets/known_hosts:ro',root+'/secrets/config.json:/run/secrets/monitor_config:ro'],
             'healthcheck':{'test':['CMD','python3','-c',"import json,time; x=json.load(open('/state/heartbeat.json')); assert time.time()*1000-x['at_ms']<60000"],'interval':'30s','timeout':'5s','retries':3,'start_period':'30s'},
             'logging':{'driver':'json-file','options':{'max-size':'5m','max-file':'2'}}}}}
