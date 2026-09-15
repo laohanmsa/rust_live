@@ -245,6 +245,12 @@ fn live_sizing_uses_approved_bands_and_keeps_liquidity_and_fee_checks() -> anyho
         ("0.99", "50.999", "20", "20"),
         ("0.99", "51", "5", "5"),
         ("0.999", "50", "5", "5"),
+        // FAK may fill partially: the larger Rust budget must not suppress a signal.
+        ("0.99", "10", "20", "20"),
+        ("0.99", "1", "20", "20"),
+        ("0.98", "5", "10", "10"),
+        ("0.999", "0.5", "5", "5"),
+        ("0.50", "39", "20", "40"),
     ] {
         let book = json!({"token_id":"1","best_ask":{"price":price,"size":depth},
             "tick_size":"0.001","loser_bid":"0"});
@@ -261,7 +267,7 @@ fn live_sizing_uses_approved_bands_and_keeps_liquidity_and_fee_checks() -> anyho
         assert_eq!(d.budget, budget.parse()?, "price {price}, depth {depth}");
         assert_eq!(d.shares, shares.parse()?, "price {price}, depth {depth}");
     }
-    let book = json!({"token_id":"1","best_ask":{"price":"0.50","size":"39"},
+    let book = json!({"token_id":"1","best_ask":{"price":"0.50","size":"0"},
         "tick_size":"0.001","loser_bid":"0"});
     assert_eq!(
         decide(
@@ -274,7 +280,7 @@ fn live_sizing_uses_approved_bands_and_keeps_liquidity_and_fee_checks() -> anyho
             "30".parse()?
         )
         .err(),
-        Some("insufficient_ask_liquidity")
+        Some("invalid_ask")
     );
     Ok(())
 }

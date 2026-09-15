@@ -492,9 +492,8 @@ pub fn decide(
     if shares < context.min_order_size || shares <= Decimal::ZERO {
         return Err("below_market_minimum_size");
     }
-    if depth < shares {
-        return Err("insufficient_ask_liquidity");
-    }
+    // FAK accepts partial fills; like Django's ceil(depth / size), any positive
+    // ask depth permits one attempt. The requested cash remains budget-bounded.
     let history = reservations
         .slots
         .entry(context.market_id.clone())

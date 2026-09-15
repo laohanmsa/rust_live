@@ -32,6 +32,38 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
+async fn input_permit(
+    slots: &Arc<Semaphore>,
+    signal_ms: u64,
+    max_age_ms: u64,
+) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+    let remaining = max_age_ms.saturating_sub(now_ms().saturating_sub(signal_ms));
+    if remaining == 0 {
+        return Err("signal_expired_waiting_for_slot");
+    }
+    tokio::time::timeout(
+        Duration::from_millis(remaining),
+        slots.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| "signal_expired_waiting_for_slot")?
+    .map_err(|_| "executor_unavailable")
+}
+
+fn parse_ober_input(payload: &[u8], max_age_ms: u64) -> Result<Value, &'static str> {
+    if payload.len() > 1_048_576 {
+        return Err("invalid_ober_payload");
+    }
+    let book: Value = serde_json::from_slice(payload).map_err(|_| "invalid_ober_payload")?;
+    let timestamp = event_ms(&book["timestamp"]);
+    if timestamp.is_none_or(|ts| {
+        ts > now_ms().saturating_add(10) || now_ms().saturating_sub(ts) > max_age_ms
+    }) {
+        return Err("stale_or_invalid_ober_time");
+    }
+    Ok(book)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -509,20 +541,23 @@ impl App {
     async fn nats_loop(self: Arc<Self>) {
         loop {
             let app = self.clone();
-            let options = async_nats::ConnectOptions::new().event_callback(move |event| {
-                let app = app.clone();
-                async move {
-                    match event {
-                        async_nats::Event::Connected => {
-                            app.nats_up.store(true, Ordering::SeqCst);
+            // Reuse NATS's bounded subscription buffer while waiting for an executor slot.
+            let options = async_nats::ConnectOptions::new()
+                .subscription_capacity(1024)
+                .event_callback(move |event| {
+                    let app = app.clone();
+                    async move {
+                        match event {
+                            async_nats::Event::Connected => {
+                                app.nats_up.store(true, Ordering::SeqCst);
+                            }
+                            async_nats::Event::Disconnected => {
+                                app.nats_up.store(false, Ordering::SeqCst);
+                            }
+                            _ => {}
                         }
-                        async_nats::Event::Disconnected => {
-                            app.nats_up.store(false, Ordering::SeqCst);
-                        }
-                        _ => {}
                     }
-                }
-            });
+                });
             if let Ok(client) = options.connect(&self.settings.nats_url).await
                 && let Ok(mut sub) = client.subscribe("ober.*.best").await
             {
@@ -530,18 +565,61 @@ impl App {
                 while let Some(message) = sub.next().await {
                     self.telemetry.received();
                     let received = Instant::now();
-                    match self.slots.clone().try_acquire_owned() {
+                    // Empty/expired books never occupy execution slots or wait behind a submit.
+                    let book =
+                        match parse_ober_input(&message.payload, self.settings.max_signal_age_ms) {
+                            Ok(book) => book,
+                            Err(reason) => {
+                                self.telemetry.finished(
+                                    &Reply::blocked("", reason),
+                                    elapsed_ms(received),
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                    {
+                        let mut data = self.data.write().await;
+                        data.last_ober_ms = now_ms();
+                        let clock = if book["timestamp"]
+                            .as_u64()
+                            .is_some_and(|t| t >= 100_000_000_000_000)
+                        {
+                            "ober_receive_us"
+                        } else {
+                            "exchange_snapshot_ms"
+                        };
+                        *data.clocks.entry(clock.into()).or_default() += 1;
+                    }
+                    if book["best_ask"].is_null() {
+                        self.telemetry.finished(
+                            &Reply::blocked("", "missing_ask"),
+                            elapsed_ms(received),
+                            false,
+                        );
+                        continue;
+                    }
+                    match input_permit(
+                        &self.slots,
+                        event_ms(&book["timestamp"]).unwrap_or(0),
+                        self.settings.max_signal_age_ms,
+                    )
+                    .await
+                    {
                         Ok(permit) => {
                             let app = self.clone();
                             tokio::spawn(async move {
                                 app.receive(&message.payload, permit, received).await;
                             });
                         }
-                        Err(_) => self.telemetry.finished(
-                            &Reply::blocked("", "inflight_limit"),
-                            0.0,
-                            false,
-                        ),
+                        Err(reason) => {
+                            self.remember_rejection(&book, reason).await;
+                            self.telemetry.finished(
+                                &Reply::blocked("", reason),
+                                elapsed_ms(received),
+                                false,
+                            );
+                        }
                     }
                 }
             }
@@ -564,43 +642,20 @@ impl App {
             },
             Sha256::digest(payload)
         );
-        let book = serde_json::from_slice::<Value>(payload);
         let mut reply = Reply::blocked(&id, "");
-        let mut book = match book {
-            Ok(book) if payload.len() <= 1048576 => book,
-            _ => {
-                reply.reason = "invalid_ober_payload".into();
+        // Revalidate after slot waiting; the source clock remains the original message clock.
+        let mut book = match parse_ober_input(payload, self.settings.max_signal_age_ms) {
+            Ok(book) => book,
+            Err(reason) => {
+                reply.reason = reason.into();
                 self.telemetry.finished(&reply, elapsed_ms(received), false);
                 return;
             }
         };
         let timestamp = event_ms(&book["timestamp"]);
-        if timestamp.is_none_or(|ts| {
-            ts > now_ms().saturating_add(10)
-                || now_ms().saturating_sub(ts) > self.settings.max_signal_age_ms
-        }) {
-            reply.reason = "stale_or_invalid_ober_time".into();
-            self.telemetry.finished(&reply, elapsed_ms(received), false);
-            return;
-        }
         let local_clock = book["timestamp"]
             .as_u64()
             .is_some_and(|t| t >= 100_000_000_000_000);
-        {
-            let mut data = self.data.write().await;
-            data.last_ober_ms = now_ms();
-            *data
-                .clocks
-                .entry(
-                    if local_clock {
-                        "ober_receive_us"
-                    } else {
-                        "exchange_snapshot_ms"
-                    }
-                    .into(),
-                )
-                .or_default() += 1;
-        }
         if book["best_ask"].is_null() {
             reply.reason = "missing_ask".into();
             self.telemetry.finished(&reply, elapsed_ms(received), false);
@@ -800,10 +855,14 @@ impl App {
     async fn remember_rejection(&self, book: &Value, reason: &str) {
         let mut data = self.data.write().await;
         let market = book["market_id"].as_str().unwrap_or("");
-        let sample = json!({"at_ms":now_ms(),"market_id":market,"reason":reason,"ask":book["best_ask"],
+        let sample = json!({"event":"signal_rejected","at_ms":now_ms(),"signal_at_ms":event_ms(&book["timestamp"]),"token_id":book["token_id"],"market_id":market,"reason":reason,"ask":book["best_ask"],
             "context_status":data.markets.get(market).and_then(|c|c.resolution.as_ref()).map(|r|&r.status),
             "lifecycle_status":data.lifecycle.marks.get(market).map(|m|&m.status)});
-        if data.rejections.len() == 32 {
+        // Keep decision skips in the existing bounded container logs for later order comparisons.
+        if reason != "not_winner_token" {
+            eprintln!("{sample}");
+        }
+        if data.rejections.len() == 256 {
             data.rejections.pop_front();
         }
         data.rejections.push_back(sample);
@@ -1174,6 +1233,27 @@ async fn serve_inner(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn busy_executor_waits_for_a_fresh_signal_but_never_replays_an_expired_one() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.unwrap();
+        let start = now_ms();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        });
+        let permit = input_permit(&slots, start, 200).await;
+        release.await.unwrap();
+        assert!(
+            permit.is_ok(),
+            "temporary concurrency must not discard a fresh signal"
+        );
+        drop(permit);
+        assert!(input_permit(&slots, now_ms() - 201, 200).await.is_err());
+        let _held = slots.clone().acquire_owned().await.unwrap();
+        assert!(input_permit(&slots, now_ms(), 10).await.is_err());
+    }
+
     #[test]
     fn live_config_requires_full_cap_and_valid_sizing() -> Result<()> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/live.json");
@@ -1292,8 +1372,9 @@ mod tests {
             "best_ask":{"price":"0.90","size":"20"},"best_bid":{"price":"0.82","size":"100"},"tick_size":"0.001",
             "top_5_asks":[{"price":"0.90","size":"20"}],"top_5_bids":[{"price":"0.82","size":"100"}]});
             if native {
-                book["best_ask"] = json!({"price":"0.50","size":"100"});
-                book["top_5_asks"] = json!([{"price":"0.50","size":"100"}]);
+                // The complete receive/sign/submit path must permit a partial FAK.
+                book["best_ask"] = json!({"price":"0.50","size":"10"});
+                book["top_5_asks"] = json!([{"price":"0.50","size":"10"}]);
             }
             app.receive(
                 &serde_json::to_vec(&book)?,

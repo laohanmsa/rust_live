@@ -429,3 +429,14 @@ This generates synthetic local files and does not access production or the excha
 The million-order synthetic check passed on the workstation with a 45.1 MiB maximum resident set.
 First index recovery took 35.1 seconds; generation, recovery, queries, and a second reopen took 121.7 seconds in the debug test build.
 These measurements are local test evidence, not a production latency guarantee.
+
+### 信号一致性与局部更新
+
+FAK（立即成交、剩余取消）允许部分成交，正的卖盘深度即可尝试；保持请求数量和预算上限，不要求放大后的整单都能立即成交。
+这与 Django 使用向上取整计算可参与账户数的规则一致。
+空卖盘先过滤，执行槽位繁忙时使用消息订阅已有的有界缓冲，在原信号 200 ms 有效期内等待；过期信号不会重放。
+跳过记录包含市场、代币、原始信号时间和原因，写入既有容器日志，最近 256 条也可从观测命令读取。
+每市场的成交次数上限继续有效，老应用模拟单不占实际成交次数，因此它们可能与已成交的旁路出现合法差异。
+
+只更新交易容器时运行 `./deploy.sh --live-account airdrop_224 --trader-only`。
+该命令保留现有 UMA（预言机数据）容器镜像和监控容器，并检查运行版本是待部署版本的祖先，防止覆盖其他分支已上线的变更。
