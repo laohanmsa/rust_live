@@ -9,7 +9,13 @@
   "max_signal_age_ms": 200,
   "max_inflight": 8,
   "context_max_age_ms": 90000,
-  "max_order_budget_pusd": "10.00",
+  "max_order_budget_pusd": "30.00",
   "total_budget_pusd": null,
-  "uma_url": "http://uma:8788"
+  "uma_url": "http://uma:8788",
+  "order_sizing": {
+    "standard": "5.00",
+    "below_005": "5.00",
+    "below_080": "20.00",
+    "at_099_low_depth": "20.00"
+  }
 }

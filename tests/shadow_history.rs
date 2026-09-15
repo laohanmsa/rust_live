@@ -71,7 +71,7 @@ async fn signed_mock_order_retries_history_and_recovers_ack_without_resubmission
     let task = tokio::spawn(async move { axum::serve(listener, router).await });
     let http = reqwest::Client::new();
     assert!(export_once(&http, &url, &journal).await.is_err());
-    assert!(journal.lock().await.exported.is_empty());
+    assert!(journal.lock().await.exported_count == 0);
     fail.store(false, Ordering::SeqCst);
     assert_eq!(export_once(&http, &url, &journal).await?, 1);
     let sent = bodies.lock().await;
@@ -86,7 +86,7 @@ async fn signed_mock_order_retries_history_and_recovers_ack_without_resubmission
     let recovered = Arc::new(Mutex::new(Journal::open(&path, &scope)?));
     assert_eq!(export_once(&http, &url, &recovered).await?, 0);
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
-    let mut entry = recovered.lock().await.orders[&signal.id].clone();
+    let mut entry = recovered.lock().await.get(&signal.id)?.unwrap();
     entry.signal.id = format!("live-{}", "b".repeat(64));
     entry.reply.id = entry.signal.id.clone();
     entry.signal.ask = "0.999".parse()?;

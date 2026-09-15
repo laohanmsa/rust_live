@@ -48,9 +48,17 @@ pub struct Settings {
     pub max_inflight: usize,
     pub context_max_age_ms: u64,
     pub max_order_budget_pusd: Decimal,
+    #[serde(default)]
+    pub order_sizing: Option<crate::shadow_state::OrderSizing>,
     pub total_budget_pusd: Option<Decimal>,
 }
 impl Settings {
+    fn account_ready(&self, response: &Value) -> bool {
+        response["ready"] == true
+            && crate::shadow_state::decimal(&response["trade_capacity_pusd"])
+                .is_some_and(|value| value >= self.max_order_budget_pusd)
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         let s: Self = serde_json::from_slice(&std::fs::read(path)?)?;
         ensure!((1..=32).contains(&s.max_inflight), "invalid concurrency");
@@ -73,6 +81,19 @@ impl Settings {
             ),
             "invalid mock session budget"
         );
+        if let Some(sizing) = &s.order_sizing {
+            ensure!(
+                [
+                    sizing.standard,
+                    sizing.below_005,
+                    sizing.below_080,
+                    sizing.at_099_low_depth
+                ]
+                .iter()
+                .all(|value| *value > Decimal::ZERO && *value <= s.max_order_budget_pusd),
+                "invalid sizing budget"
+            );
+        }
         Ok(s)
     }
 }
@@ -195,7 +216,7 @@ impl App {
                                 .is_some_and(|s| s.eq_ignore_ascii_case(&account.funder)),
                         "live identity mismatch"
                     );
-                    Ok::<bool, anyhow::Error>(response["ready"] == true)
+                    Ok::<bool, anyhow::Error>(self.settings.account_ready(&response))
                 }
                 .await;
                 self.data.write().await.live_ready_at_ms = if matches!(ready, Ok(true)) {
@@ -258,7 +279,10 @@ impl App {
                 "stale Django snapshot"
             );
             if page.config.is_some() {
-                policy = page.config;
+                policy = page.config.map(|mut p| {
+                    p.order_sizing = self.settings.order_sizing.clone();
+                    p
+                });
             }
             rows.extend(page.results);
             if !page.has_more {
@@ -965,6 +989,8 @@ async fn metrics(
     result["queued"] = json!(0);
     result["boot_at_ms"] = json!(app.boot_at_ms);
     result["mode"] = json!(app.exchange.mode());
+    result["order_sizing"] = json!(app.settings.order_sizing);
+    result["max_order_budget_pusd"] = json!(app.settings.max_order_budget_pusd);
     result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"valuation_mode":"local_m5","valuation_inputs":data.markets.values().filter(|c|c.market_volume.is_some()&&c.event_volume.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
     result["sources"]["recent_rejections"] = json!(data.rejections);
     result["sources"]["lifecycle_marks"] = json!(data.lifecycle.marks.len());
@@ -981,16 +1007,24 @@ async fn metrics(
         json!(now_ms().saturating_sub(data.live_ready_at_ms));
     let history_error = data.history_error.clone();
     drop(data);
-    let ledger = app.journal.lock().await;
-    result["history"] = json!({"exported":ledger.exported.len(),"pending":ledger.orders.values().filter(|o|matches!(o.reply.state.as_str(), "accepted" | "unknown" | "rejected")&&!ledger.exported.contains(&o.signal.id)).count(),"budget_used":ledger.used.to_string(),"budget_limit":app.settings.total_budget_pusd.map(|v|v.to_string()),"error":history_error});
-    result["history"]["journal_entries"] = json!(ledger.orders.len());
-    result["history"]["unresolved"] = json!(
-        ledger
-            .orders
-            .values()
-            .filter(|o| matches!(o.reply.state.as_str(), "unknown" | "prepared"))
-            .count()
-    );
+    let ledger = app.journal.clone();
+    let limit = app.settings.total_budget_pusd;
+    let history = tokio::task::spawn_blocking(move || {
+        let ledger = ledger.blocking_lock();
+        Ok::<_, anyhow::Error>(json!({"exported":ledger.exported_count,"pending":ledger.pending_count()?,
+            "budget_used":ledger.used.to_string(),"budget_limit":limit.map(|v|v.to_string()),"error":history_error,
+            "journal_entries":ledger.count,"journal_capacity":crate::journal::ORDER_CAPACITY,"unresolved":ledger.unresolved_count()?}))
+    }).await;
+    match history {
+        Ok(Ok(history)) => result["history"] = history,
+        _ => {
+            app.halt("journal_read_failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"journal_read_failed"})),
+            );
+        }
+    }
     (StatusCode::OK, Json(result))
 }
 async fn markets(State(app): State<Arc<App>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -1021,8 +1055,8 @@ pub async fn serve(settings: Settings) -> Result<()> {
 
 pub async fn serve_live(settings: Settings, path: &Path, account: &str) -> Result<()> {
     ensure!(
-        settings.max_order_budget_pusd <= Decimal::from(10),
-        "live per-order limit is 10"
+        settings.max_order_budget_pusd <= Decimal::from(30),
+        "live per-order limit is 30"
     );
     ensure!(
         settings.history_url.ends_with("/api/rust-live-orders/"),
@@ -1057,16 +1091,8 @@ async fn serve_inner(
         token: c.access_token,
     });
     let journal = Journal::open(Path::new(&settings.journal), &exchange.scope())?;
-    let stopped = journal
-        .orders
-        .values()
-        .any(|o| o.reply.state == "unknown" || o.reply.state == "prepared");
-    let mut restore = journal
-        .orders
-        .values()
-        .map(|o| (o.signal.token_id.to_string(), o.signal.observed_at_ms))
-        .collect::<Vec<_>>();
-    restore.sort_by_key(|(_, at)| *at);
+    let stopped = journal.unresolved_count()? > 0;
+    let restore = journal.recent_orders(now_ms().saturating_sub(10_800_000))?;
     let bind = settings.bind.clone();
     let max = settings.max_inflight;
     let app = Arc::new(App {
@@ -1147,6 +1173,23 @@ async fn serve_inner(
 mod tests {
     use super::*;
 
+    #[test]
+    fn live_config_requires_full_cap_and_valid_sizing() -> Result<()> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/live.json");
+        let settings = Settings::read(&path)?;
+        assert_eq!(settings.max_order_budget_pusd, Decimal::from(30));
+        assert!(settings.account_ready(&json!({"ready":true,"trade_capacity_pusd":"30"})));
+        for response in [
+            json!({"ready":true,"trade_capacity_pusd":"29.99"}),
+            json!({"ready":false,"trade_capacity_pusd":"1000"}),
+            json!({"ready":true}),
+            json!({"ready":true,"trade_capacity_pusd":"NaN"}),
+        ] {
+            assert!(!settings.account_ready(&response));
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn first_signal_with_no_cached_valuation_submits_independently_of_live_quota()
     -> Result<()> {
@@ -1198,7 +1241,21 @@ mod tests {
                     max_signal_age_ms: 5000,
                     max_inflight: 8,
                     context_max_age_ms: 90000,
-                    max_order_budget_pusd: "10".parse()?,
+                    max_order_budget_pusd: if native {
+                        Decimal::from(30)
+                    } else {
+                        Decimal::from(10)
+                    },
+                    order_sizing: if native {
+                        Some(crate::shadow_state::OrderSizing {
+                            standard: Decimal::from(5),
+                            below_005: Decimal::from(5),
+                            below_080: Decimal::from(20),
+                            at_099_low_depth: Decimal::from(20),
+                        })
+                    } else {
+                        None
+                    },
                     total_budget_pusd: Some("100".parse()?),
                 },
                 data: RwLock::new(Data {
@@ -1232,6 +1289,10 @@ mod tests {
             let mut book = json!({"market_id":"test-market","token_id":"42","timestamp":now_ms()*1000,
             "best_ask":{"price":"0.90","size":"20"},"best_bid":{"price":"0.82","size":"100"},"tick_size":"0.001",
             "top_5_asks":[{"price":"0.90","size":"20"}],"top_5_bids":[{"price":"0.82","size":"100"}]});
+            if native {
+                book["best_ask"] = json!({"price":"0.50","size":"100"});
+                book["top_5_asks"] = json!([{"price":"0.50","size":"100"}]);
+            }
             app.receive(
                 &serde_json::to_vec(&book)?,
                 app.slots.clone().acquire_owned().await?,
@@ -1240,17 +1301,24 @@ mod tests {
             .await;
             let permits = app.slots.acquire_many(8).await?;
             assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+            let id = format!("shadow-{:x}", Sha256::digest(serde_json::to_vec(&book)?));
+            assert_eq!(
+                app.journal.lock().await.get(&id)?.unwrap().reply.state,
+                "accepted"
+            );
             assert_eq!(
                 app.journal
                     .lock()
                     .await
-                    .orders
-                    .values()
-                    .next()
+                    .get(&id)?
                     .unwrap()
                     .reply
-                    .state,
-                "accepted"
+                    .submitted_amount,
+                Some(if native {
+                    Decimal::from(20)
+                } else {
+                    "4.50".parse()?
+                })
             );
             drop(permits);
             book["timestamp"] = json!(now_ms() * 1000);

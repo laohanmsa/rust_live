@@ -24,6 +24,7 @@ async-nats = "0.38"
 redis = { version = "0.32", features = ["tokio-comp"] }
 futures-util = "0.3"
 rust_decimal = { version = "1", features = ["maths"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"

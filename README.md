@@ -396,3 +396,35 @@ bash tests/uma_replacement/run-brahma.sh
 详见 [复审与实际失败清单](tests/uma_replacement/REVIEW.md)。
 本套件验证解码、状态处理及回环故障注入，不等于完整生产替换证明。
 实际进程崩溃后的持久游标、消息服务停机后的可靠重放、旧消费者入库、长时间静默和高峰长稳仍需独立验收。
+
+## Rust live sizing and million-order journal (2026-09-15)
+
+`deploy/live.json` now owns the independent live sizing bands through `order_sizing`.
+Prices below 0.05 use 5 pUSD; prices from 0.05 inclusive to 0.80 exclusive use 20; exactly 0.99 with fewer than 50 shares across the first five asks uses 20; all other eligible prices use 5.
+The live per-order cap is 30, and the cumulative budget remains unlimited.
+The ordinary 5-unit band and all non-sizing guards remain unchanged.
+Django shared strategy amounts are not modified; shadow configurations without an override continue using the previous policy.
+The configured bands must be positive and no greater than the configured cap.
+The balance/readiness poll now also requires `trade_capacity_pusd` to cover the cap, using the minimum of cached cash and both exchange allowances.
+Deploy the Dashboard receipt/capacity endpoint change before this client; a missing capacity field blocks new live orders.
+This remains a periodic readiness check, not a shared concurrent funds reservation.
+
+The journal allows 1,000,000 unique preparations, with at most one final result each.
+Original JSONL order and acknowledgement files remain authoritative and are not converted, deleted, or truncated.
+A restricted `*.index.sqlite` file holds record offsets and indexes for deduplication, pending history, unresolved submissions, and recent orders.
+The derived index is rebuilt from the authoritative files at every startup with an 8 MiB SQLite page cache; full old order payloads are no longer kept in memory.
+Only the derived index is replaced on startup, so it is safe to rebuild after a crash.
+The index uses no durability journal because its recovery source is the synchronously written JSONL audit.
+All order lookup and history batch reads run on blocking workers.
+History synchronization reads at most 25 pending records rather than scanning the full lifetime population.
+Monitoring uses the reported journal capacity and alerts at 80 percent, now 800,000 orders.
+Unknown submissions, malformed order logs, scope mismatches, and write failures retain fail-closed behavior.
+Rollback to a binary with the old 50,000-order limit is only possible while the journal is still below that old limit.
+
+The regular build runs the legacy-log recovery regression with 50,001 orders.
+Run the same regression with `JOURNAL_SCALE_ORDERS=1000000 cargo test --locked --test journal_scale -- --nocapture` to check the requested capacity, pending-history lookup, deduplication, budget totals, acknowledgements, and reopening.
+This generates synthetic local files and does not access production or the exchange.
+
+The million-order synthetic check passed on the workstation with a 45.1 MiB maximum resident set.
+First index recovery took 35.1 seconds; generation, recovery, queries, and a second reopen took 121.7 seconds in the debug test build.
+These measurements are local test evidence, not a production latency guarantee.

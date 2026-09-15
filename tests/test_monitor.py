@@ -51,6 +51,13 @@ class MonitorTest(unittest.TestCase):
         config['ssh_relay']='root@70.34.203.243; echo unsafe'
         with self.assertRaises(ValueError):ssh_command(config)
 
+    def test_journal_alert_uses_reported_capacity(self):
+        s=self.snapshot()
+        s['metrics']['history'].update(journal_entries=50000,journal_capacity=1000000)
+        self.assertNotIn('journal_capacity',issues(s,1000))
+        s['metrics']['history']['journal_entries']=800000
+        self.assertIn('journal_capacity',issues(s,1000))
+
     def test_stale_uma_and_unknown_orders_are_detected(self):
         s=self.snapshot();s['uma']['scan_age_ms']=11000
         s['metrics']['history']['unresolved']=1

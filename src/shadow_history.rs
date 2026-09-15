@@ -59,24 +59,10 @@ async fn export(
     journal: &Arc<Mutex<Journal>>,
     live: Option<(&str, &str)>,
 ) -> Result<usize> {
-    // ponytail: scan at most 50,000 bounded journal rows; add a pending index if profiling warrants it.
-    let batch = {
-        let ledger = journal.lock().await;
-        ledger
-            .orders
-            .values()
-            .filter(|o| {
-                o.signal
-                    .id
-                    .starts_with(if live.is_some() { "live-" } else { "shadow-" })
-                    && (matches!(o.reply.state.as_str(), "accepted" | "unknown")
-                        || (live.is_some() && o.reply.state == "rejected"))
-                    && !ledger.exported.contains(&o.signal.id)
-            })
-            .take(25)
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let ledger = journal.clone();
+    let is_live = live.is_some();
+    let batch = tokio::task::spawn_blocking(move || ledger.blocking_lock().pending_batch(is_live))
+        .await??;
     let mut count = 0;
     for entry in batch {
         let mut body = payload(&entry)?;

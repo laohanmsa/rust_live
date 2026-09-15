@@ -33,7 +33,7 @@ def issues(snapshot, now):
         out['unknown_order'] = (0, '存在结果未知的提交，需要先核对成交，不能直接重启重发')
     if history.get('pending',0) or history.get('error'):
         out['history_backlog'] = (60, '订单历史同步持续积压或失败')
-    if history.get('journal_entries',0) >= 40000:
+    if history.get('journal_entries',0) >= .8 * history.get('journal_capacity',50000):
         out['journal_capacity'] = (0, '订单日志已达到容量的 80%，需要归档维护')
     if uma.get('ready') is not True or uma.get('scan_age_ms',0)>10000 or uma.get('head_age_ms',0)>15000:
         out['uma_unhealthy'] = (30, '独立 UMA 监听或补抓未就绪: '+str(uma.get('fault') or uma.get('error') or '链上数据过期'))

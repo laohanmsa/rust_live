@@ -206,3 +206,71 @@ fn native_uma_overlay_uses_chain_time_and_never_overrides_terminal_evidence() ->
     assert!(!context.eligible);
     Ok(())
 }
+
+#[test]
+fn live_sizing_uses_approved_bands_and_keeps_liquidity_and_fee_checks() -> anyhow::Result<()> {
+    use polym_rust_demo::shadow_state::{MarketContext, Policy, Reservations, decide};
+    use std::sync::Arc;
+    let context: MarketContext = serde_json::from_value(json!({
+        "market_id":"m","question":"Synthetic","tags":[],"eligible":true,
+        "token_id_yes":"1","token_id_no":"2","active":true,"closed":false,
+        "accepting_orders":true,"auto_archived":false,"min_tick_size":"0.001",
+        "min_order_size":"5","neg_risk":false,"fees_enabled":false,
+        "fee_schedule":null,"fee_verification_status":"unverified",
+        "has_disputed_resolution":false,"existing_order_count":0,"valuation":null,
+        "market_volume":"0","event_volume":"0",
+        "resolution":{"id":1,"request_id":"r","status":"proposed","proposed_price":"1",
+        "propose_time_ms":1000,"block_number":10,"dispute_block_number":null,
+        "settle_block_number":null,"disputed":false,"settled":false}
+    }))?;
+    let policy: Policy = serde_json::from_value(json!({
+        "valuation_key":"m5_expected_payout","manual_trade_shutdown_enabled":false,
+        "strategy_enabled":true,"max_ask_price":"0.999","max_orders_per_market":1,
+        "ev_threshold":"0.0002","order_size_usd":"5","low_price_order_size_usd":"10",
+        "low_depth_099_order_size_usd":"10","order_sizing":{
+        "standard":"5","below_005":"5","below_080":"20","at_099_low_depth":"20"}
+    }))?;
+    let mut life = Lifecycle::default();
+    life.seed("m", context.resolution.as_ref().unwrap());
+    for (price, depth, budget, shares) in [
+        ("0.04", "1000", "5", "125"),
+        ("0.05", "1000", "20", "400"),
+        ("0.50", "100", "20", "40"),
+        ("0.799", "100", "20", "25"),
+        ("0.80", "100", "5", "6"),
+        ("0.99", "49", "20", "20"),
+        ("0.99", "50", "5", "5"),
+        ("0.999", "50", "5", "5"),
+    ] {
+        let book = json!({"token_id":"1","best_ask":{"price":price,"size":depth},
+            "tick_size":"0.001","loser_bid":"0"});
+        let d = decide(
+            Arc::new(context.clone()),
+            &policy,
+            &life,
+            &book,
+            &mut Reservations::default(),
+            1000,
+            "30".parse()?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(d.budget, budget.parse()?, "price {price}, depth {depth}");
+        assert_eq!(d.shares, shares.parse()?, "price {price}, depth {depth}");
+    }
+    let book = json!({"token_id":"1","best_ask":{"price":"0.50","size":"39"},
+        "tick_size":"0.001","loser_bid":"0"});
+    assert_eq!(
+        decide(
+            Arc::new(context),
+            &policy,
+            &life,
+            &book,
+            &mut Reservations::default(),
+            1000,
+            "30".parse()?
+        )
+        .err(),
+        Some("insufficient_ask_liquidity")
+    );
+    Ok(())
+}

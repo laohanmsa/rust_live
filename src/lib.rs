@@ -324,10 +324,7 @@ impl Service {
             "journal already exceeds configured budget"
         );
         let markets = exchange.warm(&config.tokens).await?;
-        let stopped =
-            Arc::new(AtomicBool::new(journal.orders.values().any(|o| {
-                o.reply.state == "unknown" || o.reply.state == "prepared"
-            })));
+        let stopped = Arc::new(AtomicBool::new(journal.unresolved_count()? > 0));
         let context = Arc::new(ContextState {
             telemetry: telemetry::Telemetry::default(),
             boot_at_ms: now_ms(),
@@ -426,9 +423,17 @@ async fn order(
     if !authorized(&headers, &s.key) {
         return unauthorized();
     };
-    match s.context.journal.lock().await.orders.get(&id) {
-        Some(r) => reply(r.reply.clone()),
-        None => (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"}))),
+    let ledger = s.context.journal.clone();
+    match tokio::task::spawn_blocking(move || ledger.blocking_lock().get(&id)).await {
+        Ok(Ok(Some(r))) => reply(r.reply),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"}))),
+        _ => {
+            s.context.stopped.store(true, Ordering::SeqCst);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"journal_read_failed"})),
+            )
+        }
     }
 }
 async fn signal(
@@ -500,7 +505,16 @@ fn validate(s: &Signal, cfg: &Config, market: &Market, live: bool) -> Result<()>
 }
 async fn process(ctx: Arc<ContextState>, s: &Signal, received: Instant) -> Reply {
     let queue_ms = elapsed_ms(received);
-    if let Some(old) = ctx.journal.lock().await.orders.get(&s.id) {
+    let ledger = ctx.journal.clone();
+    let id = s.id.clone();
+    let old = match tokio::task::spawn_blocking(move || ledger.blocking_lock().get(&id)).await {
+        Ok(Ok(old)) => old,
+        _ => {
+            ctx.stopped.store(true, Ordering::SeqCst);
+            return Reply::blocked(&s.id, "journal_read_failed");
+        }
+    };
+    if let Some(old) = old {
         if old.signal == *s {
             let mut r = old.reply.clone();
             r.replayed = true;

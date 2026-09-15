@@ -259,8 +259,19 @@ pub struct MarketContext {
     pub resolution: Option<Resolution>,
     pub valuation: Option<Valuation>,
 }
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderSizing {
+    pub standard: Decimal,
+    pub below_005: Decimal,
+    pub below_080: Decimal,
+    pub at_099_low_depth: Decimal,
+}
+
 #[derive(Clone, Deserialize)]
 pub struct Policy {
+    #[serde(default)]
+    pub order_sizing: Option<OrderSizing>,
     pub valuation_key: Option<String>,
     pub manual_trade_shutdown_enabled: bool,
     pub strategy_enabled: bool,
@@ -452,7 +463,17 @@ pub fn decide(
     if fair_value - price - fee <= policy.ev_threshold {
         return Err("ev_below_threshold");
     }
-    let budget = if price < d("0.05") {
+    let budget = if let Some(sizing) = &policy.order_sizing {
+        if price < d("0.05") {
+            sizing.below_005
+        } else if price < d("0.80") {
+            sizing.below_080
+        } else if price == d("0.99") && depth < d("50") {
+            sizing.at_099_low_depth
+        } else {
+            sizing.standard
+        }
+    } else if price < d("0.05") {
         Decimal::ONE
     } else if price < d("0.5") {
         policy.order_size_usd.max(policy.low_price_order_size_usd)

@@ -7,6 +7,7 @@ ENV CARGO_BUILD_JOBS=4
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
+COPY deploy ./deploy
 RUN --mount=type=cache,id=polym-rust-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=polym-rust-target,target=/source/target,sharing=locked \
     cargo test --locked && cargo clippy --locked --all-targets -- -D warnings && cargo fmt --check && cargo build --release --locked && cp target/release/polym-rust-demo /binary
