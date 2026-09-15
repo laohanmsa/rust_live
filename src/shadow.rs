@@ -100,6 +100,28 @@ struct Data {
     rejections: VecDeque<Value>,
 }
 impl Data {
+    fn restore_orders(&mut self) {
+        let seeds = std::mem::take(&mut self.restore);
+        for (token, at) in seeds {
+            if now_ms().saturating_sub(at) >= 10_800_000 {
+                continue;
+            }
+            if let Some(market) = self.tokens.get(&token).cloned() {
+                self.reservations
+                    .slots
+                    .entry(market.clone())
+                    .or_default()
+                    .push_back(at);
+                self.reservations
+                    .last_order
+                    .entry(market)
+                    .and_modify(|old| *old = (*old).max(at))
+                    .or_insert(at);
+            } else {
+                self.restore.push((token, at));
+            }
+        }
+    }
     fn prune_lifecycle(&mut self) {
         let active = self.markets.keys().cloned().collect();
         self.lifecycle_pruned += self.lifecycle.prune_inactive(&active, now_ms()) as u64;
@@ -315,26 +337,7 @@ impl App {
                             data.markets
                                 .insert(context.market_id.clone(), Arc::new(context));
                         }
-                        let seeds = std::mem::take(&mut data.restore);
-                        for (token, at) in seeds {
-                            if now_ms().saturating_sub(at) >= 10_800_000 {
-                                continue;
-                            }
-                            if let Some(market) = data.tokens.get(&token).cloned() {
-                                data.reservations
-                                    .slots
-                                    .entry(market.clone())
-                                    .or_default()
-                                    .push_back(at);
-                                data.reservations
-                                    .last_order
-                                    .entry(market)
-                                    .and_modify(|old| *old = (*old).max(at))
-                                    .or_insert(at);
-                            } else {
-                                data.restore.push((token, at));
-                            }
-                        }
+                        data.restore_orders();
                         if policy.is_some() {
                             data.policy = policy;
                         }
@@ -702,9 +705,16 @@ impl App {
                 } else if let Some(r) = &context.resolution {
                     data.lifecycle.seed(&context.market_id, r);
                 }
+                for token in [&context.token_id_yes, &context.token_id_no]
+                    .into_iter()
+                    .flatten()
+                {
+                    data.tokens.insert(token.clone(), context.market_id.clone());
+                }
                 data.markets
                     .insert(context.market_id.clone(), Arc::new(context));
             }
+            data.restore_orders();
             if policy.is_some() {
                 data.policy = policy;
             }
@@ -1144,7 +1154,7 @@ mod tests {
             let now = now_ms();
             let page = json!({"schema_version":1,"captured_at_ms":now,"has_more":false,"next_after_id":null,
             "config":{"valuation_key":"m5_expected_payout","manual_trade_shutdown_enabled":false,"strategy_enabled":true,
-                "max_ask_price":"0.999","max_orders_per_market":1,"ev_threshold":"0.0002","order_size_usd":"5",
+                "max_ask_price":"0.999","max_orders_per_market":if native {2}else{1},"ev_threshold":"0.0002","order_size_usd":"5",
                 "low_price_order_size_usd":"10","low_depth_099_order_size_usd":"10"},
             "results":[{"market_id":"test-market","question":"Synthetic market","market_volume":"0","event_volume":"0",
                 "tags":["Sports"],"eligible":true,"token_id_yes":"42","token_id_no":"43","active":true,"closed":false,
@@ -1192,6 +1202,11 @@ mod tests {
                     total_budget_pusd: Some("100".parse()?),
                 },
                 data: RwLock::new(Data {
+                    restore: if native {
+                        vec![("42".into(), now - 61_000)]
+                    } else {
+                        Vec::new()
+                    },
                     last_sync_ms: now,
                     synced_epoch: Some(1),
                     native_uma_at_ms: now,

@@ -363,17 +363,46 @@ impl App {
         Ok(())
     }
     async fn rescan(&self, from: u64, to: u64, head: Value) -> Result<()> {
-        let logs=self.rpc.call("eth_getLogs",json!([{"fromBlock":format!("0x{from:x}"),"toBlock":format!("0x{to:x}"),"address":ORACLES,"topics":[topics()]}])).await?;
+        let mut last = None;
+        for url in &self.rpc.urls {
+            let rpc = Rpc {
+                http: self.rpc.http.clone(),
+                urls: vec![url.clone()],
+            };
+            match self.rescan_on(&rpc, from, to, head.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("no usable scan provider")))
+    }
+    async fn rescan_on(&self, rpc: &Rpc, from: u64, to: u64, head: Value) -> Result<()> {
+        let logs=rpc.call("eth_getLogs",json!([{"fromBlock":format!("0x{from:x}"),"toBlock":format!("0x{to:x}"),"address":ORACLES,"topics":[topics()]}])).await?;
         let logs = logs.as_array().context("logs must be an array")?;
-        let mut canonical = HashMap::new();
         let mut decoded = Vec::new();
-        let unique: BTreeMap<u64, Value> = logs
-            .iter()
-            .map(|log| Ok((hex_u64(&log["blockNumber"])?, log.clone())))
-            .collect::<Result<_>>()?;
-        let times = futures_util::stream::iter(unique)
-            .map(|(block, log)| async move {
-                Ok::<_, anyhow::Error>((block, self.timestamp(&log).await?))
+        let mut blocks = std::collections::BTreeSet::new();
+        for log in logs {
+            blocks.insert(hex_u64(&log["blockNumber"])?);
+        }
+        blocks.extend(
+            self.feed
+                .read()
+                .await
+                .events
+                .range((from, 0)..=(to, u64::MAX))
+                .map(|((b, _), _)| *b),
+        );
+        let headers = futures_util::stream::iter(blocks)
+            .map(|block| async move {
+                let h = rpc.header(&format!("0x{block:x}")).await?;
+                ensure!(hex_u64(&h["number"])? == block, "wrong header number");
+                Ok::<_, anyhow::Error>((
+                    block,
+                    (
+                        h["hash"].as_str().context("header hash")?.to_owned(),
+                        hex_u64(&h["timestamp"])?,
+                    ),
+                ))
             })
             .buffer_unordered(8)
             .collect::<Vec<_>>()
@@ -386,14 +415,17 @@ impl App {
                 (from..=to).contains(&block) && log["removed"] != true,
                 "invalid scan range"
             );
-            let ts = times[&block];
-            if let Some(e) = decode(log, ts)? {
-                canonical.insert(e.key(), e.block_hash.clone());
+            let (hash, ts) = &headers[&block];
+            ensure!(
+                log["blockHash"].as_str() == Some(hash),
+                "noncanonical event block"
+            );
+            if let Some(e) = decode(log, *ts)? {
                 decoded.push(e);
             }
         }
         // Validate the head used for this range after loading its logs.
-        let check = self.rpc.header(&format!("0x{to:x}")).await?;
+        let check = rpc.header(&format!("0x{to:x}")).await?;
         ensure!(check["hash"] == head["hash"], "chain changed during scan");
         {
             let _order = self.publish.lock().await;
@@ -401,7 +433,11 @@ impl App {
             let removed: Vec<_> = f
                 .events
                 .range((from, 0)..=(to, u64::MAX))
-                .filter(|(k, e)| canonical.get(k).is_some_and(|hash| hash != &e.block_hash))
+                .filter(|(_, e)| {
+                    headers
+                        .get(&e.block_number)
+                        .is_some_and(|(hash, _)| hash != &e.block_hash)
+                })
                 .map(|(k, _)| *k)
                 .collect();
             if !removed.is_empty() {
@@ -449,11 +485,11 @@ impl App {
                 let head = self.rpc.header("latest").await?;
                 let height = hex_u64(&head["number"])?;
                 let (initialized, anchor, hash) = {let f=self.feed.read().await;(f.initialized,f.scanned_block,f.scanned_hash.clone())};
-                if initialized {
+                if anchor > 0 {
                     let canonical=self.rpc.header(&format!("0x{anchor:x}")).await?;
                     if canonical["hash"].as_str()!=Some(&hash) {
                         let _order=self.publish.lock().await;let mut f=self.feed.write().await;
-                        f.initialized=false;f.events.clear();f.sequence+=1;f.reorgs+=1;f.fault="reorg_rescan".into();
+                        f.initialized=false;f.events.clear();f.scanned_block=0;f.scanned_hash.clear();f.sequence+=1;f.reorgs+=1;f.fault="reorg_rescan".into();
                         self.headers.lock().await.clear();
                         self.nats.publish(SUBJECT,serde_json::to_vec(&json!({"kind":"reset","epoch":self.epoch,"sequence":f.sequence}))?.into()).await?;
                         bail!("reorg requires full reconstruction");
@@ -472,7 +508,7 @@ impl App {
                             high = mid;
                         }
                     }
-                    let mut from = low;
+                    let mut from = low.max(self.feed.read().await.scanned_block.saturating_sub(64));
                     while from <= height {
                         let to = (from + 499).min(height);
                         let h = self.rpc.header(&format!("0x{to:x}")).await?;
@@ -485,7 +521,7 @@ impl App {
                     }
                     let verified=self.rpc.header(&format!("0x{height:x}")).await?;
                     if verified["hash"] != head["hash"] {
-                        let mut f=self.feed.write().await;f.events.clear();f.fault="bootstrap_reorg".into();
+                        let mut f=self.feed.write().await;f.events.clear();f.scanned_block=0;f.scanned_hash.clear();f.fault="bootstrap_reorg".into();
                         bail!("bootstrap chain changed");
                     }
                     self.feed.write().await.initialized = true;
@@ -538,7 +574,10 @@ impl App {
                                 Some(2)=> {let n=hex_u64(&result["number"])?;let ts=hex_u64(&result["timestamp"])?;let hash=result["hash"].as_str().context("head hash")?.to_owned();let mut h=self.headers.lock().await;h.insert(n,(hash,ts));while h.len()>16384 {h.pop_first();}},
                                 Some(1)=> {
                                     if result["removed"]==true {
-                                        let _order=self.publish.lock().await;let mut f=self.feed.write().await;f.fault="reorg_rescan".into();f.sequence+=1;
+                                        let _order=self.publish.lock().await;let mut f=self.feed.write().await;
+                                        let key=(hex_u64(&result["blockNumber"])?,hex_u64(&result["logIndex"])?);
+                                        if f.events.get(&key).is_some_and(|e|Some(e.block_hash.as_str())==result["blockHash"].as_str()) {f.events.remove(&key);}
+                                        f.fault="reorg_rescan".into();f.sequence+=1;
                                         self.nats.publish(SUBJECT,serde_json::to_vec(&json!({"kind":"reset","epoch":self.epoch,"sequence":f.sequence}))?.into()).await?;
                                     } else {
                                         let ts=self.timestamp(result).await?;
@@ -580,6 +619,7 @@ async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     Json(app.health().await)
 }
 pub async fn serve(path: &Path) -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cfg: Config = serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(
         (14_400..=86_400).contains(&cfg.retention_seconds)
@@ -614,12 +654,13 @@ pub async fn serve(path: &Path) -> Result<()> {
         ws: RwLock::new(vec![json!({"connected":false}); urls.len()]),
         headers: Mutex::new(BTreeMap::new()),
     });
-    tokio::spawn(app.clone().scan_loop());
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(app.clone().scan_loop());
     for (i, url) in urls.into_iter().enumerate() {
-        tokio::spawn(app.clone().ws_loop(i, url));
+        tasks.spawn(app.clone().ws_loop(i, url));
     }
     let heartbeat = app.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             let _order = heartbeat.publish.lock().await;
             let h = heartbeat.health().await;
@@ -631,7 +672,7 @@ pub async fn serve(path: &Path) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
-    axum::serve(
+    let server = axum::serve(
         tokio::net::TcpListener::bind(bind).await?,
         Router::new()
             .route("/health", get(health))
@@ -647,8 +688,11 @@ pub async fn serve(path: &Path) -> Result<()> {
                 }),
             )
             .with_state(app),
-    )
-    .await?;
+    );
+    tokio::select! {
+        result=server => {result?;},
+        _=tasks.join_next() => {bail!("UMA background task ended; process restart required");}
+    }
     Ok(())
 }
 
@@ -661,6 +705,8 @@ mod tests {
     }
     #[test]
     fn decoder_matches_existing_topics_and_rejects_other_adapters() -> Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::ClientConfig::builder();
         assert_eq!(
             ProposePrice::SIGNATURE_HASH.to_string(),
             "0x6e51dd00371aabffa82cd401592f76ed51e98a9ea4b58751c70463a2c78b5ca1"
