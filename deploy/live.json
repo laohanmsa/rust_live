@@ -10,5 +10,6 @@
   "max_inflight": 8,
   "context_max_age_ms": 90000,
   "max_order_budget_pusd": "10.00",
-  "total_budget_pusd": null
+  "total_budget_pusd": null,
+  "uma_url": "http://uma:8788"
 }

@@ -40,6 +40,8 @@ pub struct Settings {
     pub ober_url: String,
     pub nats_url: String,
     pub redis_url: String,
+    #[serde(default)]
+    pub uma_url: Option<String>,
     pub bind: String,
     pub journal: String,
     pub max_signal_age_ms: u64,
@@ -93,6 +95,8 @@ struct Data {
     history_error: String,
     live_ready_at_ms: u64,
     lifecycle_pruned: u64,
+    native_uma_at_ms: u64,
+    native_uma_health: Value,
     rejections: VecDeque<Value>,
 }
 impl Data {
@@ -201,9 +205,12 @@ impl App {
         }
     }
     fn ready(&self, data: &Data) -> bool {
-        (self.live.is_none()
-            || (now_ms().saturating_sub(data.live_ready_at_ms) < 10_000
-                && data.history_error.is_empty()))
+        (self.settings.uma_url.is_none()
+            || (now_ms().saturating_sub(data.native_uma_at_ms) < 5_000
+                && data.native_uma_health["ready"] == true))
+            && (self.live.is_none()
+                || (now_ms().saturating_sub(data.live_ready_at_ms) < 10_000
+                    && data.history_error.is_empty()))
             && !self.stopped.load(Ordering::SeqCst)
             && self.nats_up.load(Ordering::SeqCst)
             && self.redis_up.load(Ordering::SeqCst)
@@ -271,12 +278,14 @@ impl App {
                             data.markets.clear();
                             data.tokens.clear();
                         }
-                        for context in rows {
+                        for mut context in rows {
                             data.lifecycle.reconcile_settles(
                                 &context.market_id,
                                 &context.settled_request_blocks,
                             );
-                            if let Some(r) = &context.resolution {
+                            if self.settings.uma_url.is_some() {
+                                crate::native_uma::overlay(&mut context, &data.lifecycle, now_ms());
+                            } else if let Some(r) = &context.resolution {
                                 data.lifecycle.seed(&context.market_id, r);
                             }
                             for token in [&context.token_id_yes, &context.token_id_no]
@@ -346,6 +355,80 @@ impl App {
                 }
             }
             tokio::select! { _=self.notify.notified()=>{tokio::time::sleep(Duration::from_millis(100)).await;}, _=tokio::time::sleep(Duration::from_secs(2))=>{} }
+        }
+    }
+    async fn uma_loop(self: Arc<Self>) {
+        if self.settings.uma_url.is_none() {
+            return self.redis_loop().await;
+        }
+        loop {
+            if self.native_session().await.is_err() {
+                self.redis_up.store(false, Ordering::SeqCst);
+                self.redis_epoch.fetch_add(1, Ordering::SeqCst);
+                self.data.write().await.native_uma_health =
+                    json!({"ready":false,"fault":"native_feed_resync"});
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    async fn native_session(&self) -> Result<()> {
+        let nats = async_nats::connect(&self.settings.nats_url).await?;
+        let mut sub = nats.subscribe("rust.uma.events").await?;
+        nats.flush().await?;
+        let mut refresh = tokio::time::interval(Duration::from_secs(30));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut epoch = String::new();
+        let mut sequence = 0;
+        loop {
+            tokio::select! {
+                biased;
+                _ = refresh.tick() => {
+                    if epoch.is_empty() {self.redis_up.store(false, Ordering::SeqCst);}
+                    let url = format!("{}/snapshot", self.settings.uma_url.as_deref().context("UMA URL")?.trim_end_matches('/'));
+                    let response = self.http.get(url).send().await?.error_for_status()?.bytes().await?;
+                    ensure!(response.len() <= 64 * 1024 * 1024, "UMA snapshot too large");
+                    let value: Value = serde_json::from_slice(&response)?;
+                    let (new_epoch, new_sequence, mut lifecycle) = crate::native_uma::snapshot(&value)?;
+                    lifecycle.needs_refresh.retain(|market|lifecycle.marks.get(market).is_some_and(|m|m.status=="proposed"));
+                    let mut data = self.data.write().await;
+                    data.lifecycle = lifecycle;
+                    let Data {markets,lifecycle,..} = &mut *data;
+                    for context in markets.values_mut() {crate::native_uma::overlay(Arc::make_mut(context),lifecycle,now_ms());}
+                    data.native_uma_health = value["health"].clone();
+                    data.native_uma_at_ms = now_ms();
+                    if epoch != new_epoch {self.redis_epoch.fetch_add(1, Ordering::SeqCst);}
+                    epoch = new_epoch; sequence = new_sequence;
+                    self.redis_up.store(true, Ordering::SeqCst);
+                    drop(data);self.notify.notify_one();
+                }
+                message = tokio::time::timeout(Duration::from_secs(5), sub.next()) => {
+                    let message = message?.context("UMA feed ended")?;
+                    ensure!(message.payload.len() <= 128 * 1024, "oversized UMA message");
+                    let value: Value = serde_json::from_slice(&message.payload)?;
+                    // The subscription was installed before the snapshot. Discard its covered messages.
+                    if value["epoch"].as_str() == Some(&epoch) && value["sequence"].as_u64().is_some_and(|s| s < sequence) {continue;}
+                    let apply = crate::native_uma::next_sequence(&epoch,sequence,&value)?;
+                    let mut data = self.data.write().await;
+                    if apply {
+                        let e: crate::uma::Event = serde_json::from_value(value["event"].clone())?;
+                        e.validate()?;
+                        data.lifecycle.apply(&e.channel,&value["event"]);
+                        if e.channel != "uma:resolution" {data.lifecycle.needs_refresh.remove(&e.market_id);}
+                        let Data {markets,lifecycle,..} = &mut *data;
+                        if let Some(context)=markets.get_mut(&e.market_id) {crate::native_uma::overlay(Arc::make_mut(context),lifecycle,now_ms());}
+                        *data.uma_counts.entry(e.channel).or_default() += 1;
+                        data.last_uma_ms = now_ms();
+                        sequence = value["sequence"].as_u64().context("sequence")?;
+                        if value["ready"] == false {data.native_uma_health["ready"] = json!(false);}
+                    } else if value["kind"] == "heartbeat" {
+                        let captured=value["health"]["captured_at_ms"].as_u64().context("heartbeat timestamp")?;
+                        if now_ms().abs_diff(captured)>5_000 {continue;}
+                        data.native_uma_health = value["health"].clone();
+                        data.native_uma_at_ms = now_ms();
+                    }
+                    drop(data);self.notify.notify_one();
+                }
+            }
         }
     }
     async fn redis_loop(self: Arc<Self>) {
@@ -611,10 +694,12 @@ impl App {
                 .await
                 .map_err(|_| "context_fetch_failed")?;
             let mut data = self.data.write().await;
-            for context in rows {
+            for mut context in rows {
                 data.lifecycle
                     .reconcile_settles(&context.market_id, &context.settled_request_blocks);
-                if let Some(r) = &context.resolution {
+                if self.settings.uma_url.is_some() {
+                    crate::native_uma::overlay(&mut context, &data.lifecycle, now_ms());
+                } else if let Some(r) = &context.resolution {
                     data.lifecycle.seed(&context.market_id, r);
                 }
                 data.markets
@@ -875,10 +960,27 @@ async fn metrics(
     result["sources"]["lifecycle_marks"] = json!(data.lifecycle.marks.len());
     result["sources"]["lifecycle_pruned"] = json!(data.lifecycle_pruned);
     result["sources"]["lifecycle_terminal_proofs"] = json!(data.lifecycle.terminal_proof_count());
+    result["sources"]["uma_source"] = json!(if app.settings.uma_url.is_some() {
+        "rust_direct"
+    } else {
+        "legacy_redis"
+    });
+    result["sources"]["native_uma"] = data.native_uma_health.clone();
+    result["sources"]["native_uma_age_ms"] = json!(now_ms().saturating_sub(data.native_uma_at_ms));
+    result["sources"]["account_ready_age_ms"] =
+        json!(now_ms().saturating_sub(data.live_ready_at_ms));
     let history_error = data.history_error.clone();
     drop(data);
     let ledger = app.journal.lock().await;
     result["history"] = json!({"exported":ledger.exported.len(),"pending":ledger.orders.values().filter(|o|matches!(o.reply.state.as_str(), "accepted" | "unknown" | "rejected")&&!ledger.exported.contains(&o.signal.id)).count(),"budget_used":ledger.used.to_string(),"budget_limit":app.settings.total_budget_pusd.map(|v|v.to_string()),"error":history_error});
+    result["history"]["journal_entries"] = json!(ledger.orders.len());
+    result["history"]["unresolved"] = json!(
+        ledger
+            .orders
+            .values()
+            .filter(|o| matches!(o.reply.state.as_str(), "unknown" | "prepared"))
+            .count()
+    );
     (StatusCode::OK, Json(result))
 }
 async fn markets(State(app): State<Arc<App>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -983,13 +1085,24 @@ async fn serve_inner(
             .build()?,
     });
     let tasks = [
-        tokio::spawn(app.clone().redis_loop()),
+        tokio::spawn(app.clone().uma_loop()),
         tokio::spawn(app.clone().nats_loop()),
         tokio::spawn(app.clone().sync_loop()),
         tokio::spawn(app.clone().history_loop()),
     ];
     let router = Router::new()
         .route("/health", get(health))
+        .route(
+            "/ready",
+            get(|State(app): State<Arc<App>>| async move {
+                let data = app.data.read().await;
+                if app.ready(&data) {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
         .route("/metrics", get(metrics))
         .route("/markets", get(markets))
         .route("/stop", post(stop))
@@ -1027,8 +1140,9 @@ mod tests {
     #[tokio::test]
     async fn first_signal_with_no_cached_valuation_submits_independently_of_live_quota()
     -> Result<()> {
-        let now = now_ms();
-        let page = json!({"schema_version":1,"captured_at_ms":now,"has_more":false,"next_after_id":null,
+        for native in [false, true] {
+            let now = now_ms();
+            let page = json!({"schema_version":1,"captured_at_ms":now,"has_more":false,"next_after_id":null,
             "config":{"valuation_key":"m5_expected_payout","manual_trade_shutdown_enabled":false,"strategy_enabled":true,
                 "max_ask_price":"0.999","max_orders_per_market":1,"ev_threshold":"0.0002","order_size_usd":"5",
                 "low_price_order_size_usd":"10","low_depth_099_order_size_usd":"10"},
@@ -1039,122 +1153,129 @@ mod tests {
                 "existing_order_count":1,"valuation":null,
                 "resolution":{"id":1,"request_id":"r","status":"proposed","proposed_price":"1","propose_time_ms":now,
                     "block_number":10,"dispute_block_number":null,"settle_block_number":null,"disputed":false,"settled":false}}]});
-        let router = Router::new()
-            .route(
-                "/context",
-                get(move || {
-                    let page = page.clone();
-                    async move { Json(page) }
+            let router = Router::new()
+                .route(
+                    "/context",
+                    get(move || {
+                        let page = page.clone();
+                        async move { Json(page) }
+                    }),
+                )
+                .route(
+                    "/book/43/best",
+                    get(|| async { Json(json!({"token_id":"43","best_bid":"0.10"})) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move { axum::serve(listener, router).await });
+            let mock = demo::MockExchange::start().await?;
+            let exchange = Exchange::shadow(&mock.url).await?;
+            let path = std::env::temp_dir()
+                .join(format!("shadow-parity-{}-{now}.jsonl", std::process::id()));
+            let journal = Journal::open(&path, &exchange.scope())?;
+            let app = Arc::new(App {
+                live: None,
+                history_notify: Notify::new(),
+                settings: Settings {
+                    django_url: format!("{url}/context"),
+                    history_url: format!("{url}/history"),
+                    ober_url: url,
+                    nats_url: String::new(),
+                    redis_url: String::new(),
+                    uma_url: native.then_some("http://unused-uma-in-interface-test".into()),
+                    bind: String::new(),
+                    journal: path.to_string_lossy().into(),
+                    max_signal_age_ms: 5000,
+                    max_inflight: 8,
+                    context_max_age_ms: 90000,
+                    max_order_budget_pusd: "10".parse()?,
+                    total_budget_pusd: Some("100".parse()?),
+                },
+                data: RwLock::new(Data {
+                    last_sync_ms: now,
+                    synced_epoch: Some(1),
+                    native_uma_at_ms: now,
+                    native_uma_health: json!({"ready":true}),
+                    ..Data::default()
                 }),
-            )
-            .route(
-                "/book/43/best",
-                get(|| async { Json(json!({"token_id":"43","best_bid":"0.10"})) }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let url = format!("http://{}", listener.local_addr()?);
-        let server = tokio::spawn(async move { axum::serve(listener, router).await });
-        let mock = demo::MockExchange::start().await?;
-        let exchange = Exchange::shadow(&mock.url).await?;
-        let path =
-            std::env::temp_dir().join(format!("shadow-parity-{}-{now}.jsonl", std::process::id()));
-        let journal = Journal::open(&path, &exchange.scope())?;
-        let app = Arc::new(App {
-            live: None,
-            history_notify: Notify::new(),
-            settings: Settings {
-                django_url: format!("{url}/context"),
-                history_url: format!("{url}/history"),
-                ober_url: url,
-                nats_url: String::new(),
-                redis_url: String::new(),
-                bind: String::new(),
-                journal: path.to_string_lossy().into(),
-                max_signal_age_ms: 5000,
-                max_inflight: 8,
-                context_max_age_ms: 90000,
-                max_order_budget_pusd: "10".parse()?,
-                total_budget_pusd: Some("100".parse()?),
-            },
-            data: RwLock::new(Data {
-                last_sync_ms: now,
-                synced_epoch: Some(1),
-                ..Data::default()
-            }),
-            telemetry: Telemetry::default(),
-            exchange,
-            journal: Arc::new(Mutex::new(journal)),
-            slots: Arc::new(Semaphore::new(8)),
-            notify: Notify::new(),
-            nats_up: AtomicBool::new(true),
-            redis_up: AtomicBool::new(true),
-            redis_epoch: AtomicU64::new(1),
-            stopped: AtomicBool::new(false),
-            stop_reason: std::sync::Mutex::new(None),
-            boot_at_ms: now,
-            http: reqwest::Client::new(),
-        });
-        let mut book = json!({"market_id":"test-market","token_id":"42","timestamp":now_ms()*1000,
+                telemetry: Telemetry::default(),
+                exchange,
+                journal: Arc::new(Mutex::new(journal)),
+                slots: Arc::new(Semaphore::new(8)),
+                notify: Notify::new(),
+                nats_up: AtomicBool::new(true),
+                redis_up: AtomicBool::new(true),
+                redis_epoch: AtomicU64::new(1),
+                stopped: AtomicBool::new(false),
+                stop_reason: std::sync::Mutex::new(None),
+                boot_at_ms: now,
+                http: reqwest::Client::new(),
+            });
+            if native {
+                app.data.write().await.lifecycle.apply("uma:resolution",&json!({"market_id":"test-market","request_id":"r","block_number":10,"proposed_price":1,"block_timestamp":now/1000}));
+            }
+            let mut book = json!({"market_id":"test-market","token_id":"42","timestamp":now_ms()*1000,
             "best_ask":{"price":"0.90","size":"20"},"best_bid":{"price":"0.82","size":"100"},"tick_size":"0.001",
             "top_5_asks":[{"price":"0.90","size":"20"}],"top_5_bids":[{"price":"0.82","size":"100"}]});
-        app.receive(
-            &serde_json::to_vec(&book)?,
-            app.slots.clone().acquire_owned().await?,
-            Instant::now(),
-        )
-        .await;
-        let permits = app.slots.acquire_many(8).await?;
-        assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            app.journal
-                .lock()
-                .await
-                .orders
-                .values()
-                .next()
-                .unwrap()
-                .reply
-                .state,
-            "accepted"
-        );
-        drop(permits);
-        book["timestamp"] = json!(now_ms() * 1000);
-        app.receive(
-            &serde_json::to_vec(&book)?,
-            app.slots.clone().acquire_owned().await?,
-            Instant::now(),
-        )
-        .await;
-        assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            app.data.read().await.rejections.back().unwrap()["reason"],
-            "max_orders_per_market"
-        );
-        app.data.write().await.lifecycle.apply(
-            "uma:dispute_price",
-            &json!({"market_id":"test-market","request_id":"r","block_number":11}),
-        );
-        app.receive(
-            &serde_json::to_vec(&book)?,
-            app.slots.clone().acquire_owned().await?,
-            Instant::now(),
-        )
-        .await;
-        assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            app.data.read().await.rejections.back().unwrap()["reason"],
-            "not_proposed_or_lifecycle_changed"
-        );
-        app.halt("lifecycle_capacity");
-        app.data.write().await.context_error.clear();
-        app.halt("manual_stop");
-        let state = health(State(app.clone())).await.0;
-        assert_eq!(state["ready"], false);
-        assert_eq!(state["stop_reason"], "lifecycle_capacity");
-        server.abort();
-        drop(app);
-        std::fs::remove_file(path.with_extension("history-acks.jsonl"))?;
-        std::fs::remove_file(path)?;
+            app.receive(
+                &serde_json::to_vec(&book)?,
+                app.slots.clone().acquire_owned().await?,
+                Instant::now(),
+            )
+            .await;
+            let permits = app.slots.acquire_many(8).await?;
+            assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                app.journal
+                    .lock()
+                    .await
+                    .orders
+                    .values()
+                    .next()
+                    .unwrap()
+                    .reply
+                    .state,
+                "accepted"
+            );
+            drop(permits);
+            book["timestamp"] = json!(now_ms() * 1000);
+            app.receive(
+                &serde_json::to_vec(&book)?,
+                app.slots.clone().acquire_owned().await?,
+                Instant::now(),
+            )
+            .await;
+            assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                app.data.read().await.rejections.back().unwrap()["reason"],
+                "max_orders_per_market"
+            );
+            app.data.write().await.lifecycle.apply(
+                "uma:dispute_price",
+                &json!({"market_id":"test-market","request_id":"r","block_number":11}),
+            );
+            app.receive(
+                &serde_json::to_vec(&book)?,
+                app.slots.clone().acquire_owned().await?,
+                Instant::now(),
+            )
+            .await;
+            assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                app.data.read().await.rejections.back().unwrap()["reason"],
+                "not_proposed_or_lifecycle_changed"
+            );
+            app.halt("lifecycle_capacity");
+            app.data.write().await.context_error.clear();
+            app.halt("manual_stop");
+            let state = health(State(app.clone())).await.0;
+            assert_eq!(state["ready"], false);
+            assert_eq!(state["stop_reason"], "lifecycle_capacity");
+            server.abort();
+            drop(app);
+            std::fs::remove_file(path.with_extension("history-acks.jsonl"))?;
+            std::fs::remove_file(path)?;
+        }
         Ok(())
     }
 }

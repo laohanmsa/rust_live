@@ -134,6 +134,9 @@ fd=os.open(root/'access.token',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o400)
 os.fchmod(fd,0o400)
 with os.fdopen(fd,'w') as f:f.write(c['access_token'])
 """)
+        if args.live_account:
+            log('amster-p: provision independent UMA endpoint configuration locally')
+            remote('amster-p','python3 -',data=(ROOT/'scripts/provision_uma.py').read_bytes())
         target=temp('amster-p');stages.append(('amster-p',target))
         remote('amster-p',f'umask 077; cat > {shlex.quote(target+"/config.json")}',data=creds)
         remote('amster-p',f'cat > {shlex.quote(target+"/compose.yaml")}',data=(ROOT/('deploy/compose.live.yaml' if args.live_account else 'deploy/compose.yaml')).read_bytes())
@@ -164,6 +167,9 @@ sudo -n cp "$root/image.env" "$root/releases/$release/image.env"
 sudo -n cp "$root/compose.yaml" "$root/releases/$release/compose.yaml"
 compose() { sudo -n docker compose -p polym-rust-demo --env-file "$root/image.env" -f "$root/compose.yaml" "$@"; }
 verify() {
+ if test @MODE@ = live; then
+  compose up -d --no-deps --pull never --wait --wait-timeout 600 uma || return 1
+ fi
  compose up -d --no-deps --pull never --wait --wait-timeout 120 trader || return 1
  cid=$(compose ps -q trader)
  test "$(sudo -n docker inspect "$cid" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision" || return 1
@@ -202,6 +208,11 @@ compose ps
         remote('amster-p','bash -s',data=script.encode())
         log('deployment verified; reading timings and resource usage')
         run([sys.executable,str(ROOT/'scripts/observe.py'),'--seconds','5'])
+        if args.live_account:
+            log('Brahma: deploy read-only monitoring and Pushover delivery')
+            command=[sys.executable,str(ROOT/'scripts/deploy_monitor.py')]
+            if args.registry_env:command.extend(['--registry-env',args.registry_env])
+            run(command)
     finally:
         for host,path in reversed(stages):
             try: remote(host,'sudo -n rm -rf -- '+shlex.quote(path))

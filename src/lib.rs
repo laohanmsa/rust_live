@@ -1,11 +1,13 @@
 pub mod demo;
 pub mod exchange;
 pub mod journal;
+pub mod native_uma;
 pub mod shadow;
 pub mod shadow_history;
 pub mod shadow_state;
 pub mod shadow_valuation;
 pub mod telemetry;
+pub mod uma;
 
 use anyhow::{Result, ensure};
 use axum::{

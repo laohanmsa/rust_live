@@ -169,3 +169,40 @@ fn lifecycle_pruning_keeps_current_markets_and_terminal_proofs() {
     life.seed("old-0", &fresh);
     assert!(life.is_proposed("old-0", "r", 20));
 }
+
+#[test]
+fn native_uma_overlay_uses_chain_time_and_never_overrides_terminal_evidence() -> anyhow::Result<()>
+{
+    use polym_rust_demo::{native_uma::overlay, shadow_state::MarketContext};
+    let now = polym_rust_demo::now_ms();
+    let mut context: MarketContext = serde_json::from_value(
+        json!({"market_id":"1","question":"Synthetic market","tags":[],"eligible":false,
+        "token_id_yes":"1","token_id_no":"2","active":true,"closed":false,"accepting_orders":true,"auto_archived":false,
+        "min_tick_size":"0.001","min_order_size":"5","neg_risk":false,"fees_enabled":false,"fee_schedule":null,
+        "fee_verification_status":"unverified","has_disputed_resolution":false,"existing_order_count":0,"resolution":null,"valuation":null}),
+    )?;
+    let proposal = json!({"market_id":"1","request_id":"r","request_timestamp":100,"oracle_address":"o","block_number":10,"log_index":1,"proposed_price":1,"block_timestamp":now/1000});
+    let mut life = Lifecycle::default();
+    life.apply("uma:resolution", &proposal);
+    overlay(&mut context, &life, now);
+    assert!(context.eligible);
+    assert_eq!(
+        context.resolution.as_ref().unwrap().propose_time_ms,
+        (now / 1000) * 1000
+    );
+    let mut stale = context.clone();
+    overlay(&mut stale, &life, now + 10_800_001);
+    assert!(!stale.eligible);
+    let mut terminal = context.clone();
+    terminal.settled_request_blocks.insert("r".into(), 11);
+    overlay(&mut terminal, &life, now);
+    assert!(!terminal.eligible);
+    let mut disputed = context.clone();
+    disputed.has_disputed_resolution = true;
+    overlay(&mut disputed, &life, now);
+    assert!(!disputed.eligible);
+    life.apply("uma:dispute_price",&json!({"market_id":"1","request_id":"r","request_timestamp":100,"oracle_address":"o","block_number":11,"log_index":1}));
+    overlay(&mut context, &life, now);
+    assert!(!context.eligible);
+    Ok(())
+}

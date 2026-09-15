@@ -17,6 +17,7 @@ pub struct Mark {
     pub index: u64,
     pub status: String,
     pub received_ms: u64,
+    pub proposed_at_ms: Option<u64>,
     pub proposed_price: Option<Decimal>,
 }
 #[derive(Default)]
@@ -114,6 +115,9 @@ impl Lifecycle {
                 index,
                 status: status.into(),
                 received_ms: now_ms(),
+                proposed_at_ms: value["block_timestamp"]
+                    .as_u64()
+                    .and_then(|t| t.checked_mul(1000)),
                 proposed_price: if status == "proposed" {
                     decimal(&value["proposed_price"])
                 } else {
@@ -181,6 +185,7 @@ impl Lifecycle {
                 index: 0,
                 status: status.into(),
                 received_ms: now_ms(),
+                proposed_at_ms: Some(resolution.propose_time_ms),
                 proposed_price: Some(resolution.proposed_price),
             },
         );
