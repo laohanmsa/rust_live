@@ -62,7 +62,9 @@ def transitions(state, found, now):
     notices = []
     for code, (delay, message) in found.items():
         row = active.setdefault(code, dict(first_seen=now, notified=False, last_sent=0))
-        row.pop('healthy_since', None)
+        recovered=row.pop('healthy_since', None)
+        if recovered is not None and not row['notified']:
+            row['first_seen']=now
         row['message'] = message
         if now-row['first_seen'] >= delay and (not row['notified'] or now-row['last_sent'] >= 1800):
             notices.append((code, 'alert', message))
@@ -107,7 +109,7 @@ def push(config, title, message, priority=0):
 def ssh_command(config):
     base=['ssh','-T','-i','/run/secrets/monitor_key','-o','BatchMode=yes','-o','IdentitiesOnly=yes',
         '-o','StrictHostKeyChecking=yes','-o','UserKnownHostsFile=/run/secrets/known_hosts',
-        '-o','ConnectTimeout=5','-o','ServerAliveInterval=5','-o','ServerAliveCountMax=1']
+        '-o','ConnectTimeout=8','-o','ServerAliveInterval=5','-o','ServerAliveCountMax=1']
     command=list(base)
     relay=config.get('ssh_relay')
     if relay:
@@ -121,12 +123,16 @@ def ssh_command(config):
 def read_snapshot(config):
     command=ssh_command(config)
     try:
-        result=subprocess.run(command,capture_output=True,timeout=15,check=True)
+        result=subprocess.run(command,capture_output=True,timeout=20,check=True)
         if len(result.stdout)>1024*1024:
             raise ValueError('snapshot size limit')
         return json.loads(result.stdout)
-    except Exception:
-        return {}
+    except subprocess.TimeoutExpired:
+        return {'monitor_read_error':'snapshot_timeout'}
+    except subprocess.CalledProcessError as error:
+        return {'monitor_read_error':'ssh_failed','ssh_exit_code':error.returncode}
+    except Exception as error:
+        return {'monitor_read_error':type(error).__name__}
 
 
 def main():

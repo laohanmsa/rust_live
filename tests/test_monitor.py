@@ -34,6 +34,14 @@ class MonitorTest(unittest.TestCase):
         delivered(state,alarm,1045)
         self.assertEqual(transitions(state,found,1060),[])
 
+    def test_intermittent_failures_do_not_accumulate_into_a_continuous_outage(self):
+        state={};found=issues({},1000)
+        self.assertEqual(transitions(state,found,1000),[])
+        self.assertEqual(transitions(state,{},1015),[])
+        self.assertEqual(transitions(state,found,1030),[])
+        self.assertEqual(transitions(state,found,1045),[])
+        self.assertEqual(transitions(state,found,1060)[0][0],'mp_unreachable')
+
     def test_relay_keeps_host_verification_and_rejects_shell_text(self):
         config={'ssh_target':'root@95.179.181.132','ssh_relay':'root@70.34.203.243'}
         command=ssh_command(config)
