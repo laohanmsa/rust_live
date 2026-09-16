@@ -272,8 +272,6 @@ pub struct OrderSizing {
 #[derive(Clone, Deserialize, serde::Serialize)]
 pub struct Policy {
     #[serde(default)]
-    pub fixed_budget: Option<Decimal>,
-    #[serde(default)]
     pub order_sizing: Option<OrderSizing>,
     pub valuation_key: Option<String>,
     pub manual_trade_shutdown_enabled: bool,
@@ -466,9 +464,7 @@ pub fn decide(
     if fair_value - price - fee <= policy.ev_threshold {
         return Err("ev_below_threshold");
     }
-    let budget = if let Some(fixed) = policy.fixed_budget {
-        fixed
-    } else if let Some(sizing) = &policy.order_sizing {
+    let budget = if let Some(sizing) = &policy.order_sizing {
         if price < d("0.05") {
             sizing.below_005
         } else if price < d("0.80") {
@@ -492,11 +488,7 @@ pub fn decide(
         policy.order_size_usd
     };
     let budget = budget.min(max_budget);
-    let shares = if policy.fixed_budget.is_some() {
-        (budget / price).trunc_with_scale(6)
-    } else {
-        (budget / (price + fee)).floor()
-    };
+    let shares = (budget / (price + fee)).floor();
     if shares < context.min_order_size || shares <= Decimal::ZERO {
         return Err("below_market_minimum_size");
     }

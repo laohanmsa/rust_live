@@ -147,7 +147,7 @@ impl App {
                     &book,
                     reservations,
                     now_ms(),
-                    Decimal::from(5),
+                    self.settings.max_order_budget_pusd,
                 )
             };
             evidence["guard_ms"] = json!(elapsed_ms(guard));
@@ -264,7 +264,7 @@ impl App {
                 "django_market_missing"
             })?;
         let mut policy = policy.ok_or("missing_strategy_config")?;
-        policy.fixed_budget = Some(Decimal::from(5));
+        policy.order_sizing = self.settings.order_sizing.clone();
         let (winner, loser) = if event.proposed_price == "1" {
             (&context.token_id_yes, &context.token_id_no)
         } else {

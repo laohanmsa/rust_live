@@ -15,12 +15,15 @@ The dry-run lane uses a dedicated PostgreSQL read-only role and a bounded pool o
    The opposite best bid is required by the existing M5 valuation.
    Sort and validate the returned levels; do not assume response ordering.
 4. Require a winner ask, then run the shared lifecycle, market status, tag, dispute, price, tick, ask-wall, fee, local M5, market-count and cooldown checks.
-5. Sign an exact five-unit cash BUY/FAK order, with its share quantity calculated by the existing exchange client.
+5. Use the same price/depth budget bands, fee-aware share rounding and BUY/FAK signing path as Rust live.
    FAK means immediate execution with any unfilled remainder canceled; acceptance is not proof of a fill.
 6. Persist the prepared order before submission, and persist the response afterward.
    Export the receipt to Dashboard as `rust_uma` using the existing durable retry/acknowledgement path.
 
-The cash amount is fixed at 5; it is not five shares and does not use the first lane's price-dependent budgets.
+The budgets match the deployed Rust live configuration: below 0.05 uses 5; 0.05 to below 0.80 uses 20; 0.80 through 0.98 uses 10; exactly 0.99 with the first five ask levels totaling less than 51 shares uses 20; all other eligible prices use 5.
+The configured per-order ceiling is 30.
+As in Rust live, shares are floored after including the estimated fee, then signed cash is truncated to cents; actual signed cash can be below the selected budget.
+For example, with no fee, a 0.90 ask selects budget 10, plans 11 shares and submits 9.90 cash.
 The price limit is the observed best winner ask.
 Orders below the maintained minimum share size are skipped.
 The displayed requested shares come from the actual signed order, including the exchange client's rounding.
@@ -85,7 +88,7 @@ Deploy the additive Dashboard change before starting the dry-run container.
 ## Validation
 
 Run `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo fmt --check`.
-The proposal tests use loopback Django/book/exchange fixtures, real order construction and signing with synthetic credentials, and validate missing markets, empty asks, restricted tags, exact cash sizing, partial-fill eligibility, duplicate identity, late disputes, connection epochs and eight overlapping context queries.
+The proposal tests use loopback Django/book/exchange fixtures, real order construction and signing with synthetic credentials, and validate missing markets, empty asks, restricted tags, live-equivalent budget and cash rounding, partial-fill eligibility, duplicate identity, late disputes, connection epochs and eight overlapping context queries.
 No live account or production state is used by these tests.
 The GitHub Actions workflow runs the same Rust checks without credentials.
 
@@ -104,3 +107,12 @@ Those numbers do not include connection pool acquisition or Rust decoding; the d
 
 The isolated PostgreSQL schema contract test runs explicitly in GitHub Actions using a disposable `rust_uma_test` database.
 It covers absent markets, market/token mapping, policy, normalized and named fees, proposal identity and settlement proofs.
+
+## Order-time book display
+
+The two complete public order books used for the decision are persisted in the existing prepared-order journal and exported with the order receipt.
+Dashboard now renders the current book beside the saved order book using its existing orderbook component.
+`/airdrop/orderbook/<token>/?order_snapshot_id=<order>&book_side=winner` reads only that order's immutable receipt; `book_side=loser` selects the opposite outcome.
+Snapshot reads are always read-only, validate token/side identity, and never fall back to a live book.
+The snapshot label shows its capture time and the elapsed time from collection to submission.
+No second public request is added to the hot path, no duplicate snapshot table is introduced, and prior `rust_uma` orders work without backfill.

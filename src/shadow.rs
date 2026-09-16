@@ -145,8 +145,8 @@ impl Settings {
                 "rust_uma requires the shared UMA service"
             );
             ensure!(
-                s.max_order_budget_pusd == Decimal::from(5) && s.order_sizing.is_none(),
-                "rust_uma uses exactly five cash units"
+                s.max_order_budget_pusd <= Decimal::from(30) && s.order_sizing.is_some(),
+                "rust_uma requires live sizing and at most thirty cash units"
             );
         }
         Ok(s)
@@ -375,7 +375,6 @@ impl App {
             if page.config.is_some() {
                 policy = page.config.map(|mut p| {
                     p.order_sizing = self.settings.order_sizing.clone();
-                    p.fixed_budget = self.settings.uma_trade.then_some(Decimal::from(5));
                     p
                 });
             }
@@ -992,25 +991,15 @@ impl App {
             book_valid: true,
         };
         let started = Instant::now();
-        let signed_result = if self.settings.uma_trade {
-            self.exchange
-                .sign_cash(
-                    &signal,
-                    Decimal::from(5),
-                    decision.tick,
-                    decision.context.neg_risk,
-                )
-                .await
-        } else {
-            self.exchange
-                .sign_shadow(
-                    &signal,
-                    decision.shares,
-                    decision.tick,
-                    decision.context.neg_risk,
-                )
-                .await
-        };
+        let signed_result = self
+            .exchange
+            .sign_shadow(
+                &signal,
+                decision.shares,
+                decision.tick,
+                decision.context.neg_risk,
+            )
+            .await;
         let signed = match signed_result {
             Ok(v) => v,
             Err(_) => {

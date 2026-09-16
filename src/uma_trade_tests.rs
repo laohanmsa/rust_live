@@ -1,10 +1,12 @@
 use super::*;
 
 #[test]
-fn uma_configuration_is_independent_and_fixed_at_five() -> Result<()> {
+fn uma_configuration_matches_live_sizing() -> Result<()> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/uma-trader.json");
     let settings = Settings::read(&path)?;
-    assert_eq!(settings.max_order_budget_pusd, Decimal::from(5));
+    let live = Settings::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/live.json"))?;
+    assert_eq!(settings.max_order_budget_pusd, live.max_order_budget_pusd);
+    assert_eq!(json!(settings.order_sizing), json!(live.order_sizing));
     assert!(settings.uma_url.is_some());
     assert!(!settings.account_ready(&json!({"ready":true,"trade_capacity_pusd":"100"})));
     assert!(settings.account_ready(
@@ -15,7 +17,7 @@ fn uma_configuration_is_independent_and_fixed_at_five() -> Result<()> {
 }
 
 #[tokio::test]
-async fn proposal_reads_django_then_public_books_and_submits_exact_five() -> Result<()> {
+async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     let now = now_ms();
     let page = json!({"schema_version":1,"captured_at_ms":now,"has_more":false,"next_after_id":null,
         "config":{"valuation_key":"m5_expected_payout","manual_trade_shutdown_enabled":false,"strategy_enabled":true,
@@ -91,7 +93,8 @@ async fn proposal_reads_django_then_public_books_and_submits_exact_five() -> Res
         "django_url":format!("{url}/context"),"history_url":format!("{url}/history"),"ober_url":"http://unused",
         "nats_url":"","redis_url":"","uma_url":"http://unused","bind":"127.0.0.1:0","journal":path,
         "max_signal_age_ms":5000,"max_inflight":8,"context_max_age_ms":90000,
-        "max_order_budget_pusd":"5","total_budget_pusd":null,
+        "max_order_budget_pusd":"30","total_budget_pusd":null,
+        "order_sizing":serde_json::from_slice::<Value>(include_bytes!("../deploy/live.json"))?["order_sizing"],
         "uma_trade":true,"clob_book_url":url
     }))?;
     let app = Arc::new(App {
@@ -172,7 +175,8 @@ async fn proposal_reads_django_then_public_books_and_submits_exact_five() -> Res
     let id = uma_trade::signal_id(&event, false);
     let entry = app.journal.lock().await.get(&id)?.unwrap();
     assert_eq!(entry.reply.state, "accepted");
-    assert_eq!(entry.reply.submitted_amount, Some(Decimal::from(5)));
+    assert_eq!(entry.reply.submitted_amount, Some("9.90".parse()?));
+    assert_eq!(entry.reserved, Decimal::from(10));
     let body = crate::shadow_history::payload(&entry)?;
     if let Ok(path) = std::env::var("RUST_UMA_TEST_RECEIPT") {
         std::fs::write(path, serde_json::to_vec_pretty(&body)?)?;
@@ -245,6 +249,8 @@ fn dry_run_config_requires_database_and_never_selects_live_history() -> Result<(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/uma-dry-run.json"),
     )?)?;
     assert_eq!(raw["database_config"], "/run/secrets/database_reader");
-    assert_eq!(s.max_order_budget_pusd, Decimal::from(5));
+    let live = Settings::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/live.json"))?;
+    assert_eq!(s.max_order_budget_pusd, live.max_order_budget_pusd);
+    assert_eq!(json!(s.order_sizing), json!(live.order_sizing));
     Ok(())
 }

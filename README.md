@@ -443,7 +443,7 @@ FAK（立即成交、剩余取消）允许部分成交，正的卖盘深度即�
 
 ## Proposal-triggered second lane
 
-The `rust_uma` lane shares the existing UMA service, queries Dashboard on each proposal, reads public order books, applies the shared guards and local M5 model, and submits five cash units using an independent account.
+The `rust_uma` lane shares the existing UMA service, queries Dashboard on each proposal, reads public order books, applies the shared guards and local M5 model, and uses the same price/depth budgets and signing calculation as Rust live with an independent account.
 Its receipts include both book snapshots and per-stage timings in Dashboard.
 See [rust_uma implementation and activation](docs/rust_uma.md) and `deploy/compose.uma.yaml`.
 The lane is disabled until an independent account and the compatible Dashboard receipt endpoint are configured.
