@@ -213,7 +213,7 @@ impl App {
             .await
             .map_err(|_| "orderbook_read_failed")?
         {
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            if bytes.len() + chunk.len() > 512 * 1024 {
                 return Err("orderbook_too_large");
             }
             bytes.extend_from_slice(&chunk);
@@ -231,16 +231,40 @@ impl App {
         evidence: &mut Value,
     ) -> Result<(Arc<MarketContext>, Policy, Value), &'static str> {
         let started = Instant::now();
-        let result = self
-            .fetch(Some(std::slice::from_ref(&event.market_id)))
-            .await;
-        evidence["django_ms"] = json!(elapsed_ms(started));
-        let (rows, policy) = result.map_err(|_| "django_context_failed")?;
+        let source = if self.database.is_some() {
+            "postgresql"
+        } else {
+            "django"
+        };
+        evidence["context_source"] = json!(source);
+        let result = if let Some(database) = &self.database {
+            database.fetch(&event.market_id).await
+        } else {
+            self.fetch(Some(std::slice::from_ref(&event.market_id)))
+                .await
+        };
+        evidence[if self.database.is_some() {
+            "database_ms"
+        } else {
+            "django_ms"
+        }] = json!(elapsed_ms(started));
+        let (rows, policy) = result.map_err(|_| {
+            if self.database.is_some() {
+                "database_context_failed"
+            } else {
+                "django_context_failed"
+            }
+        })?;
         let mut context = rows
             .into_iter()
             .find(|c| c.market_id == event.market_id)
-            .ok_or("django_market_missing")?;
-        let policy = policy.ok_or("missing_strategy_config")?;
+            .ok_or(if self.database.is_some() {
+                "database_market_missing"
+            } else {
+                "django_market_missing"
+            })?;
+        let mut policy = policy.ok_or("missing_strategy_config")?;
+        policy.fixed_budget = Some(Decimal::from(5));
         let (winner, loser) = if event.proposed_price == "1" {
             (&context.token_id_yes, &context.token_id_no)
         } else {

@@ -65,6 +65,7 @@ impl Telemetry {
             samples.insert(key, Vec::new());
         }
         for key in [
+            "database_ms",
             "django_ms",
             "book_ms",
             "winner_book_ms",
@@ -85,6 +86,7 @@ impl Telemetry {
             }
             if let Some(uma) = &r.uma {
                 for key in [
+                    "database_ms",
                     "django_ms",
                     "book_ms",
                     "winner_book_ms",

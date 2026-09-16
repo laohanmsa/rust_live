@@ -95,10 +95,12 @@ async fn proposal_reads_django_then_public_books_and_submits_exact_five() -> Res
         "uma_trade":true,"clob_book_url":url
     }))?;
     let app = Arc::new(App {
+        database: None,
         live: None,
         history_notify: Notify::new(),
         settings,
         data: RwLock::new(Data {
+            history_ready_at_ms: now,
             native_uma_at_ms: now,
             native_uma_health: json!({"ready":true}),
             ..Data::default()
@@ -231,5 +233,18 @@ async fn proposal_reads_django_then_public_books_and_submits_exact_five() -> Res
     app.receive_uma(event, Instant::now(), 1).await;
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 9);
     server.abort();
+    Ok(())
+}
+
+#[test]
+fn dry_run_config_requires_database_and_never_selects_live_history() -> Result<()> {
+    let s = Settings::read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/uma-dry-run.json"))?;
+    assert!(s.uma_trade);
+    assert!(s.history_url.ends_with("/api/shadow-orders/"));
+    let raw: Value = serde_json::from_slice(&std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/uma-dry-run.json"),
+    )?)?;
+    assert_eq!(raw["database_config"], "/run/secrets/database_reader");
+    assert_eq!(s.max_order_budget_pusd, Decimal::from(5));
     Ok(())
 }

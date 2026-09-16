@@ -71,6 +71,8 @@ fn parse_ober_input(payload: &[u8], max_age_ms: u64) -> Result<Value, &'static s
 pub struct Settings {
     #[serde(default)]
     pub uma_trade: bool,
+    #[serde(default)]
+    pub database_config: Option<String>,
     #[serde(default = "uma_trade::book_url")]
     pub clob_book_url: String,
     pub django_url: String,
@@ -168,6 +170,8 @@ struct Data {
     clocks: BTreeMap<String, u64>,
     history_error: String,
     live_ready_at_ms: u64,
+    database_ready_at_ms: u64,
+    history_ready_at_ms: u64,
     lifecycle_pruned: u64,
     native_uma_at_ms: u64,
     native_uma_health: Value,
@@ -210,6 +214,7 @@ struct LiveAccount {
 }
 
 struct App {
+    database: Option<crate::postgres_context::PostgresContext>,
     live: Option<LiveAccount>,
     history_notify: Notify,
     settings: Settings,
@@ -248,6 +253,34 @@ impl App {
     }
     async fn history_loop(self: Arc<Self>) {
         loop {
+            if let Some(database) = &self.database {
+                self.data.write().await.database_ready_at_ms =
+                    if database.ready().await { now_ms() } else { 0 };
+            }
+            if self.settings.uma_trade && self.live.is_none() {
+                let supported = async {
+                    let value: Value = self
+                        .http
+                        .get(&self.settings.history_url)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    Ok::<_, anyhow::Error>(
+                        value["dry_run"] == true
+                            && value["supported_strategies"]
+                                .as_array()
+                                .is_some_and(|v| v.iter().any(|s| s == "rust_uma")),
+                    )
+                }
+                .await;
+                self.data.write().await.history_ready_at_ms = if matches!(supported, Ok(true)) {
+                    now_ms()
+                } else {
+                    0
+                };
+            }
             let result = if let Some(account) = &self.live {
                 let ready = async {
                     let response: Value = self
@@ -302,9 +335,14 @@ impl App {
         }
     }
     fn ready(&self, data: &Data) -> bool {
-        (self.settings.uma_url.is_none()
-            || (now_ms().saturating_sub(data.native_uma_at_ms) < 5_000
-                && data.native_uma_health["ready"] == true))
+        (self.database.is_none() || now_ms().saturating_sub(data.database_ready_at_ms) < 10_000)
+            && (!self.settings.uma_trade
+                || self.live.is_some()
+                || (now_ms().saturating_sub(data.history_ready_at_ms) < 10_000
+                    && data.history_error.is_empty()))
+            && (self.settings.uma_url.is_none()
+                || (now_ms().saturating_sub(data.native_uma_at_ms) < 5_000
+                    && data.native_uma_health["ready"] == true))
             && (self.live.is_none()
                 || (now_ms().saturating_sub(data.live_ready_at_ms) < 10_000
                     && data.history_error.is_empty()))
@@ -1141,6 +1179,15 @@ async fn metrics(
         result["sources"]["context_age_ms"] = Value::Null;
         result["sources"]["pending_context"] = Value::Null;
     }
+    result["sources"]["context_source"] = json!(if app.database.is_some() {
+        "postgresql"
+    } else {
+        "django"
+    });
+    result["sources"]["database_ready_age_ms"] =
+        json!(now_ms().saturating_sub(data.database_ready_at_ms));
+    result["sources"]["history_ready_age_ms"] =
+        json!(now_ms().saturating_sub(data.history_ready_at_ms));
     result["sources"]["recent_rejections"] = json!(data.rejections);
     result["sources"]["lifecycle_marks"] = json!(data.lifecycle.marks.len());
     result["sources"]["lifecycle_pruned"] = json!(data.lifecycle_pruned);
@@ -1225,7 +1272,9 @@ async fn serve_inner(
         None
     };
     if let Some(mock) = &mock {
-        mock.state.delay_ms.store(50, Ordering::SeqCst);
+        mock.state
+            .delay_ms
+            .store(if settings.uma_trade { 0 } else { 50 }, Ordering::SeqCst);
     }
     let exchange = if let Some(c) = &credentials {
         Exchange::authorized_live(c).await?
@@ -1244,7 +1293,13 @@ async fn serve_inner(
     let restore = journal.recent_orders(now_ms().saturating_sub(10_800_000))?;
     let bind = settings.bind.clone();
     let max = settings.max_inflight;
+    let database = settings
+        .database_config
+        .as_deref()
+        .map(|path| crate::postgres_context::PostgresContext::read(Path::new(path), max))
+        .transpose()?;
     let app = Arc::new(App {
+        database,
         live,
         history_notify: Notify::new(),
         settings,
@@ -1403,10 +1458,12 @@ mod tests {
                 .join(format!("shadow-parity-{}-{now}.jsonl", std::process::id()));
             let journal = Journal::open(&path, &exchange.scope())?;
             let app = Arc::new(App {
+                database: None,
                 live: None,
                 history_notify: Notify::new(),
                 settings: Settings {
                     uma_trade: false,
+                    database_config: None,
                     clob_book_url: uma_trade::book_url(),
                     django_url: format!("{url}/context"),
                     history_url: format!("{url}/history"),

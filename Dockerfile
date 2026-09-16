@@ -7,6 +7,7 @@ ENV CARGO_BUILD_JOBS=4
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
+COPY sql ./sql
 COPY deploy ./deploy
 RUN --mount=type=cache,id=polym-rust-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=polym-rust-target,target=/source/target,sharing=locked \
@@ -20,6 +21,7 @@ COPY deploy/config.json /app/config.json
 COPY deploy/shadow.json /app/shadow.json
 COPY deploy/live.json /app/live.json
 COPY deploy/uma-trader.json /app/uma-trader.json
+COPY deploy/uma-dry-run.json /app/uma-dry-run.json
 USER 10001:10001
 ENTRYPOINT ["polym-rust-demo"]
 CMD ["serve", "/app/config.json"]

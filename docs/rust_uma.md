@@ -3,13 +3,14 @@
 This is a second process with a separate account, journal, receipt strategy and execution limit.
 The original trader keeps its existing book-driven behavior.
 Both processes subscribe independently to the existing `rust.uma.events` subject and read the same UMA service snapshot on connection or recovery.
-No second oracle listener or database connection is created.
+No second oracle listener is created.
+The dry-run lane uses a dedicated PostgreSQL read-only role and a bounded pool of eight connections.
 
 ## Processing
 
 1. Accept a fresh binary proposal from the shared sequenced feed.
-2. Query `/api/trading-context/?market_ids=<market>` once for the trigger.
-   Missing market rows are logged as `django_market_missing` and skipped without hydration or retry.
+2. Read market context and strategy policy directly from PostgreSQL in one parameterized statement.
+   Missing database rows are logged as `database_market_missing` and skipped without hydration or retry.
 3. Fetch winner and opposite `/book?token_id=...` responses concurrently from Polymarket with a persistent request client.
    The opposite best bid is required by the existing M5 valuation.
    Sort and validate the returned levels; do not assume response ordering.
@@ -75,7 +76,11 @@ The credential schema is the existing `LiveCredentials` structure; account name 
 Do not run the old `provision_live_credentials.py` unchanged for this lane: it is explicitly scoped to the original `airdrop_224` account.
 The compose file requires the explicit `live` profile, joins the existing UMA and Polym data networks, exposes health only on host loopback port 18789, and uses its own persistent volume.
 It never recreates the original trader or UMA service.
-No account was supplied for this task, and this lane has not been deployed or enabled.
+The dry-run compose file `deploy/compose.uma-dry.yaml` runs `shadow /app/uma-dry-run.json`, mounts only the read-only database credential, and uses `/api/shadow-orders/` for history.
+It does not mount account credentials and can only submit to its loopback mock exchange.
+Its records use strategy `rust_uma`, have no account, show `DRY_RUN`, and never schedule reconciliation or claim real fills.
+A compatible history endpoint and a healthy read-only database connection are required before processing proposals.
+Deploy the additive Dashboard change before starting the dry-run container.
 
 ## Validation
 
@@ -83,3 +88,19 @@ Run `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`,
 The proposal tests use loopback Django/book/exchange fixtures, real order construction and signing with synthetic credentials, and validate missing markets, empty asks, restricted tags, exact cash sizing, partial-fill eligibility, duplicate identity, late disputes, connection epochs and eight overlapping context queries.
 No live account or production state is used by these tests.
 The GitHub Actions workflow runs the same Rust checks without credentials.
+
+## Direct database contract
+
+`sql/market_context.sql` uses maintained market/event/tag/resolution/policy tables only.
+No wallet or order table is available to the reader role.
+The active proposal is overlaid from the shared UMA lifecycle, and M5 is computed locally; cached Django valuation and shared strategy order counts are intentionally not queried.
+Fees use the same normalized-rate precedence and named schedules as Dashboard.
+The query has a 750 ms server deadline, and each connection defaults to read-only operations.
+The credential is created on amster-p and never sent to the build host or committed.
+
+A read-only comparison against the existing Dashboard context builder on eight live markets found no differences in the fields consumed by the guards or strategy.
+Direct SQL execution took 21.869 ms on the first sample and 4.575-7.603 ms on the remaining seven samples.
+Those numbers do not include connection pool acquisition or Rust decoding; the deployed per-proposal `database_ms` measurement does.
+
+The isolated PostgreSQL schema contract test runs explicitly in GitHub Actions using a disposable `rust_uma_test` database.
+It covers absent markets, market/token mapping, policy, normalized and named fees, proposal identity and settlement proofs.

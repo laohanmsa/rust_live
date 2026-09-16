@@ -1,0 +1,43 @@
+# A second project; the shared UMA service and original trader are external.
+name: polym-rust-uma
+services:
+  trader-uma:
+    image: ${RUST_UMA_IMAGE:?set immutable Rust image digest}
+    command: [shadow, /app/uma-dry-run.json]
+    networks: [shared-uma, polym-data]
+    environment:
+      TOKIO_WORKER_THREADS: "2"
+    ports: ["127.0.0.1:18789:8787"]
+    volumes: [uma-order-data:/app/data]
+    secrets: [database_reader]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, "http://127.0.0.1:8787/ready"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+volumes:
+  uma-order-data:
+networks:
+  shared-uma:
+    external: true
+    name: polym-rust-demo_default
+  polym-data:
+    external: true
+    name: polym_amster_polym
+secrets:
+  database_reader:
+    file: /opt/polym-rust-uma/secrets/database-reader.json

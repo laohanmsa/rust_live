@@ -9,6 +9,18 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("demo") {
         "demo" => run_demo(args.get(1).map(|x| x.parse()).transpose()?.unwrap_or(1)).await,
+        "context-db" => {
+            ensure!(args.len() == 3, "usage: context-db CREDENTIALS MARKET_ID");
+            let database =
+                polym_rust_demo::postgres_context::PostgresContext::read(Path::new(&args[1]), 1)?;
+            let start = std::time::Instant::now();
+            let (rows, policy) = database.fetch(&args[2]).await?;
+            println!(
+                "{}",
+                json!({"results":rows,"config":policy,"elapsed_ms":start.elapsed().as_secs_f64()*1000.0})
+            );
+            Ok(())
+        }
         "uma" => {
             ensure!(args.len() == 2, "usage: uma CONFIG");
             polym_rust_demo::uma::serve(Path::new(&args[1])).await
