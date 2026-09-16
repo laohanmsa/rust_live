@@ -129,6 +129,8 @@ pub struct Signal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uma: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submitted_amount: Option<Decimal>,
     #[serde(default)]
     pub clob_response: Option<Value>,
@@ -155,6 +157,7 @@ pub struct Reply {
 impl Reply {
     fn blocked(id: &str, reason: &str) -> Self {
         Self {
+            uma: None,
             submitted_amount: None,
             clob_response: None,
             submitted_at_ms: None,

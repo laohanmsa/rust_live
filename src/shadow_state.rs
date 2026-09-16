@@ -209,7 +209,7 @@ impl Lifecycle {
             .is_some_and(|m| m.status == "proposed" && m.request == request && m.block == block)
     }
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 pub struct Resolution {
     pub id: u64,
     pub request_id: Option<String>,
@@ -222,17 +222,17 @@ pub struct Resolution {
     pub disputed: bool,
     pub settled: bool,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 pub struct Fee {
     pub rate: Decimal,
     pub exponent: Decimal,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 pub struct Valuation {
     pub expected_payout: Decimal,
     pub calculated_at_ms: u64,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 pub struct MarketContext {
     pub market_id: String,
     pub question: String,
@@ -269,8 +269,10 @@ pub struct OrderSizing {
     pub at_099_low_depth: Decimal,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 pub struct Policy {
+    #[serde(default)]
+    pub fixed_budget: Option<Decimal>,
     #[serde(default)]
     pub order_sizing: Option<OrderSizing>,
     pub valuation_key: Option<String>,
@@ -464,7 +466,9 @@ pub fn decide(
     if fair_value - price - fee <= policy.ev_threshold {
         return Err("ev_below_threshold");
     }
-    let budget = if let Some(sizing) = &policy.order_sizing {
+    let budget = if let Some(fixed) = policy.fixed_budget {
+        fixed
+    } else if let Some(sizing) = &policy.order_sizing {
         if price < d("0.05") {
             sizing.below_005
         } else if price < d("0.80") {
@@ -488,7 +492,11 @@ pub fn decide(
         policy.order_size_usd
     };
     let budget = budget.min(max_budget);
-    let shares = (budget / (price + fee)).floor();
+    let shares = if policy.fixed_budget.is_some() {
+        (budget / price).trunc_with_scale(6)
+    } else {
+        (budget / (price + fee)).floor()
+    };
     if shares < context.min_order_size || shares <= Decimal::ZERO {
         return Err("below_market_minimum_size");
     }

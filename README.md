@@ -440,3 +440,10 @@ FAK（立即成交、剩余取消）允许部分成交，正的卖盘深度即�
 
 只更新交易容器时运行 `./deploy.sh --live-account airdrop_224 --trader-only`。
 该命令保留现有 UMA（预言机数据）容器镜像和监控容器，并检查运行版本是待部署版本的祖先，防止覆盖其他分支已上线的变更。
+
+## Proposal-triggered second lane
+
+The `rust_uma` lane shares the existing UMA service, queries Dashboard on each proposal, reads public order books, applies the shared guards and local M5 model, and submits five cash units using an independent account.
+Its receipts include both book snapshots and per-stage timings in Dashboard.
+See [rust_uma implementation and activation](docs/rust_uma.md) and `deploy/compose.uma.yaml`.
+The lane is disabled until an independent account and the compatible Dashboard receipt endpoint are configured.

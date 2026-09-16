@@ -26,6 +26,12 @@ pub fn payload(entry: &Stored) -> Result<Value> {
             "dispatch_ms":r.dispatch_ms,"source_to_dispatch_ms":r.source_to_dispatch_ms,
             "post_ms":r.post_ms,"total_ms":r.total_ms}
     });
+    if let Some(uma) = &r.uma {
+        body["input_kind"] = json!("uma_propose");
+        body["market_id"] = uma["event"]["market_id"].clone();
+        body["request_id"] = uma["event"]["request_id"].clone();
+        body["uma"] = uma.clone();
+    }
     // Old journal entries omit this field, preserving their receipt retry digest.
     if entry.signal.id.starts_with("live-")
         && let Some(cash) = r.submitted_amount

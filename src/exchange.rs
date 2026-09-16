@@ -138,15 +138,29 @@ impl Exchange {
         tick: Decimal,
         neg_risk: bool,
     ) -> Result<Signed> {
+        // Preserve the original share-based sizing for the first lane.
+        let cash = (signal.ask * shares).trunc_with_scale(2);
+        self.sign_cash(signal, cash, tick, neg_risk).await
+    }
+
+    /// Sign an exact cash amount; the exchange client calculates and rounds shares.
+    pub async fn sign_cash(
+        &self,
+        signal: &Signal,
+        cash: Decimal,
+        tick: Decimal,
+        neg_risk: bool,
+    ) -> Result<Signed> {
         ensure!(
             matches!(self.mode, "shadow" | "live"),
-            "cached signing requires an initialized trading exchange"
+            "cached signing requires a trading exchange"
+        );
+        ensure!(
+            cash > Decimal::ZERO && cash.scale() <= 2,
+            "invalid_buy_amount"
         );
         self.client.set_tick_size(signal.token_id, tick.try_into()?);
         self.client.set_neg_risk(signal.token_id, neg_risk);
-        // Match Django's FAK BUY semantics: floor the cash amount to cents.
-        let cash = (signal.ask * shares).trunc_with_scale(2);
-        ensure!(cash > Decimal::ZERO, "empty_buy_amount");
         let order = self
             .client
             .market_order()

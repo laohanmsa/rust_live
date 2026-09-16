@@ -1,0 +1,44 @@
+# A second project; the shared UMA service and original trader are external.
+name: polym-rust-uma
+services:
+  trader-uma:
+    profiles: [live]
+    image: ${RUST_UMA_IMAGE:?set immutable Rust image digest}
+    command: [trade-live, /app/uma-trader.json, /run/secrets/uma_trader_credentials, "${RUST_UMA_ACCOUNT:?set the independent account name}"]
+    networks: [shared-uma, polym-data]
+    environment:
+      TOKIO_WORKER_THREADS: "2"
+    ports: ["127.0.0.1:18789:8787"]
+    volumes: [uma-order-data:/app/data]
+    secrets: [uma_trader_credentials]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, "http://127.0.0.1:8787/ready"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+volumes:
+  uma-order-data:
+networks:
+  shared-uma:
+    external: true
+    name: polym-rust-demo_default
+  polym-data:
+    external: true
+    name: polym_amster_polym
+secrets:
+  uma_trader_credentials:
+    file: ${RUST_UMA_CREDENTIALS:?set the independent account credential file}

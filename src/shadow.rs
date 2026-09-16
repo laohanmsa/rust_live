@@ -31,6 +31,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+#[path = "uma_trade.rs"]
+mod uma_trade;
 
 async fn input_permit(
     slots: &Arc<Semaphore>,
@@ -67,6 +69,10 @@ fn parse_ober_input(payload: &[u8], max_age_ms: u64) -> Result<Value, &'static s
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    #[serde(default)]
+    pub uma_trade: bool,
+    #[serde(default = "uma_trade::book_url")]
+    pub clob_book_url: String,
     pub django_url: String,
     pub history_url: String,
     pub ober_url: String,
@@ -87,6 +93,10 @@ pub struct Settings {
 impl Settings {
     fn account_ready(&self, response: &Value) -> bool {
         response["ready"] == true
+            && (!self.uma_trade
+                || response["supported_strategies"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|name| name == "rust_uma")))
             && crate::shadow_state::decimal(&response["trade_capacity_pusd"])
                 .is_some_and(|value| value >= self.max_order_budget_pusd)
     }
@@ -125,6 +135,16 @@ impl Settings {
                 .iter()
                 .all(|value| *value > Decimal::ZERO && *value <= s.max_order_budget_pusd),
                 "invalid sizing budget"
+            );
+        }
+        if s.uma_trade {
+            ensure!(
+                s.uma_url.is_some(),
+                "rust_uma requires the shared UMA service"
+            );
+            ensure!(
+                s.max_order_budget_pusd == Decimal::from(5) && s.order_sizing.is_none(),
+                "rust_uma uses exactly five cash units"
             );
         }
         Ok(s)
@@ -198,6 +218,7 @@ struct App {
     exchange: Exchange,
     journal: Arc<Mutex<Journal>>,
     slots: Arc<Semaphore>,
+    proposal_queue: Arc<Semaphore>,
     notify: Notify,
     nats_up: AtomicBool,
     redis_up: AtomicBool,
@@ -288,10 +309,12 @@ impl App {
                 || (now_ms().saturating_sub(data.live_ready_at_ms) < 10_000
                     && data.history_error.is_empty()))
             && !self.stopped.load(Ordering::SeqCst)
-            && self.nats_up.load(Ordering::SeqCst)
             && self.redis_up.load(Ordering::SeqCst)
-            && data.synced_epoch == Some(self.redis_epoch.load(Ordering::SeqCst))
-            && now_ms().saturating_sub(data.last_sync_ms) <= self.settings.context_max_age_ms
+            && (self.settings.uma_trade
+                || (self.nats_up.load(Ordering::SeqCst)
+                    && data.synced_epoch == Some(self.redis_epoch.load(Ordering::SeqCst))
+                    && now_ms().saturating_sub(data.last_sync_ms)
+                        <= self.settings.context_max_age_ms))
     }
     async fn fetch(&self, ids: Option<&[String]>) -> Result<(Vec<MarketContext>, Option<Policy>)> {
         let mut cursor = String::new();
@@ -314,6 +337,7 @@ impl App {
             if page.config.is_some() {
                 policy = page.config.map(|mut p| {
                     p.order_sizing = self.settings.order_sizing.clone();
+                    p.fixed_budget = self.settings.uma_trade.then_some(Decimal::from(5));
                     p
                 });
             }
@@ -431,7 +455,7 @@ impl App {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-    async fn native_session(&self) -> Result<()> {
+    async fn native_session(self: &Arc<Self>) -> Result<()> {
         let nats = async_nats::connect(&self.settings.nats_url).await?;
         let mut sub = nats.subscribe("rust.uma.events").await?;
         nats.flush().await?;
@@ -442,7 +466,7 @@ impl App {
         loop {
             tokio::select! {
                 biased;
-                _ = refresh.tick() => {
+                _ = refresh.tick(), if !self.settings.uma_trade || epoch.is_empty() => {
                     if epoch.is_empty() {self.redis_up.store(false, Ordering::SeqCst);}
                     let url = format!("{}/snapshot", self.settings.uma_url.as_deref().context("UMA URL")?.trim_end_matches('/'));
                     let response = self.http.get(url).send().await?.error_for_status()?.bytes().await?;
@@ -468,11 +492,20 @@ impl App {
                     // The subscription was installed before the snapshot. Discard its covered messages.
                     if value["epoch"].as_str() == Some(&epoch) && value["sequence"].as_u64().is_some_and(|s| s < sequence) {continue;}
                     let apply = crate::native_uma::next_sequence(&epoch,sequence,&value)?;
+                    let mut proposal = None;
                     let mut data = self.data.write().await;
                     if apply {
                         let e: crate::uma::Event = serde_json::from_value(value["event"].clone())?;
                         e.validate()?;
-                        data.lifecycle.apply(&e.channel,&value["event"]);
+                        let changed = data.lifecycle.apply(&e.channel,&value["event"]);
+                        if self.settings.uma_trade && data.lifecycle.marks.len() > 20_000 {
+                            data.prune_lifecycle();
+                            ensure!(data.lifecycle.marks.len() <= 20_000, "UMA lifecycle capacity");
+                        }
+                        ensure!(!self.settings.uma_trade || data.lifecycle.terminal_proof_count() <= 100_000, "UMA terminal proof capacity");
+                        if changed && self.settings.uma_trade && e.channel == "uma:resolution" {
+                            proposal = Some(e.clone());
+                        }
                         if e.channel != "uma:resolution" {data.lifecycle.needs_refresh.remove(&e.market_id);}
                         let Data {markets,lifecycle,..} = &mut *data;
                         if let Some(context)=markets.get_mut(&e.market_id) {crate::native_uma::overlay(Arc::make_mut(context),lifecycle,now_ms());}
@@ -487,6 +520,9 @@ impl App {
                         data.native_uma_at_ms = now_ms();
                     }
                     drop(data);self.notify.notify_one();
+                    if let Some(event) = proposal {
+                        self.dispatch_uma(event);
+                    }
                 }
             }
         }
@@ -727,6 +763,7 @@ impl App {
                             received,
                             policy_ms,
                             local_clock,
+                            None,
                         )
                         .await;
                     app.telemetry.finished(&result, elapsed_ms(received), true);
@@ -872,8 +909,14 @@ impl App {
         if data.decisions.len() == 50 {
             data.decisions.pop_front();
         }
-        data.decisions.push_back(json!(reply));
+        let mut compact = json!(reply);
+        if let Some(uma) = compact["uma"].as_object_mut() {
+            uma.remove("winner_book");
+            uma.remove("loser_book");
+        }
+        data.decisions.push_back(compact);
     }
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         decision: Decision,
@@ -882,8 +925,10 @@ impl App {
         received: Instant,
         policy_ms: f64,
         local_clock: bool,
+        uma: Option<Value>,
     ) -> Reply {
         let mut r = Reply::blocked(&id, "");
+        r.uma = uma;
         r.policy_ms = Some(policy_ms);
         r.queue_ms = (elapsed_ms(received) - policy_ms).max(0.0);
         let token = if decision
@@ -909,16 +954,26 @@ impl App {
             book_valid: true,
         };
         let started = Instant::now();
-        let signed = match self
-            .exchange
-            .sign_shadow(
-                &signal,
-                decision.shares,
-                decision.tick,
-                decision.context.neg_risk,
-            )
-            .await
-        {
+        let signed_result = if self.settings.uma_trade {
+            self.exchange
+                .sign_cash(
+                    &signal,
+                    Decimal::from(5),
+                    decision.tick,
+                    decision.context.neg_risk,
+                )
+                .await
+        } else {
+            self.exchange
+                .sign_shadow(
+                    &signal,
+                    decision.shares,
+                    decision.tick,
+                    decision.context.neg_risk,
+                )
+                .await
+        };
+        let signed = match signed_result {
             Ok(v) => v,
             Err(_) => {
                 r.reason = "shadow_sign_failed".into();
@@ -957,6 +1012,24 @@ impl App {
         let valid = {
             let data = self.data.read().await;
             self.ready(&data)
+                && r.uma.as_ref().is_none_or(|v| {
+                    v["feed_epoch"].as_u64() == Some(self.redis_epoch.load(Ordering::SeqCst))
+                        && data
+                            .lifecycle
+                            .marks
+                            .get(&decision.context.market_id)
+                            .is_some_and(|mark| {
+                                Some(mark.index) == v["event"]["log_index"].as_u64()
+                                    && mark.request_key
+                                        == format!(
+                                            "{}/{}/{}/{}",
+                                            decision.context.market_id,
+                                            decision.request_id,
+                                            v["event"]["request_timestamp"],
+                                            v["event"]["oracle_address"]
+                                        )
+                            })
+                })
                 && !data.lifecycle.has_dispute(&decision.context.market_id)
                 && decision.context.resolution.as_ref().is_some_and(|r| {
                     data.lifecycle.matches_proposal(
@@ -1029,7 +1102,7 @@ struct Window {
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     let data = app.data.read().await;
     Json(
-        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"stop_reason":*app.stop_reason.lock().expect("stop reason mutex"),"data_sources":"Django + UMA + OBer","execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
+        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"stop_reason":*app.stop_reason.lock().expect("stop reason mutex"),"data_sources":if app.settings.uma_trade {"Django + shared UMA + Polymarket books"} else {"Django + UMA + OBer"},"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
     )
 }
 async fn metrics(
@@ -1046,12 +1119,28 @@ async fn metrics(
     let window = w.window_seconds.unwrap_or(3600).clamp(1, 86400);
     let mut result = app.telemetry.snapshot(window);
     let data = app.data.read().await;
-    result["queued"] = json!(0);
+    result["queued"] = json!(if app.settings.uma_trade {
+        (1024 - app.proposal_queue.available_permits())
+            .saturating_sub(app.settings.max_inflight - app.slots.available_permits())
+    } else {
+        0
+    });
     result["boot_at_ms"] = json!(app.boot_at_ms);
     result["mode"] = json!(app.exchange.mode());
+    result["strategy"] = json!(if app.settings.uma_trade {
+        "rust_uma"
+    } else {
+        "rust_post_propose_winner"
+    });
     result["order_sizing"] = json!(app.settings.order_sizing);
     result["max_order_budget_pusd"] = json!(app.settings.max_order_budget_pusd);
     result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"valuation_mode":"local_m5","valuation_inputs":data.markets.values().filter(|c|c.market_volume.is_some()&&c.event_volume.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
+    if app.settings.uma_trade {
+        result["sources"]["nats_connected"] = json!(app.redis_up.load(Ordering::SeqCst));
+        result["sources"]["context_fetch_mode"] = json!("per_proposal");
+        result["sources"]["context_age_ms"] = Value::Null;
+        result["sources"]["pending_context"] = Value::Null;
+    }
     result["sources"]["recent_rejections"] = json!(data.rejections);
     result["sources"]["lifecycle_marks"] = json!(data.lifecycle.marks.len());
     result["sources"]["lifecycle_pruned"] = json!(data.lifecycle_pruned);
@@ -1167,6 +1256,7 @@ async fn serve_inner(
         exchange,
         journal: Arc::new(Mutex::new(journal)),
         slots: Arc::new(Semaphore::new(max)),
+        proposal_queue: Arc::new(Semaphore::new(1024)),
         notify: Notify::new(),
         nats_up: AtomicBool::new(false),
         redis_up: AtomicBool::new(false),
@@ -1176,16 +1266,21 @@ async fn serve_inner(
         boot_at_ms: now_ms(),
         http: reqwest::Client::builder()
             .no_proxy()
+            .retry(reqwest::retry::never())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_nodelay(true)
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
     });
-    let tasks = [
+    let mut tasks = vec![
         tokio::spawn(app.clone().uma_loop()),
-        tokio::spawn(app.clone().nats_loop()),
-        tokio::spawn(app.clone().sync_loop()),
         tokio::spawn(app.clone().history_loop()),
     ];
+    if !app.settings.uma_trade {
+        tasks.push(tokio::spawn(app.clone().nats_loop()));
+        tasks.push(tokio::spawn(app.clone().sync_loop()));
+    }
     let router = Router::new()
         .route("/health", get(health))
         .route(
@@ -1206,7 +1301,7 @@ async fn serve_inner(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!(
         "{}",
-        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"},"subscribed":"ober.*.best + UMA lifecycle"})
+        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"},"subscribed":if app.settings.uma_trade {"rust.uma.events"} else {"ober.*.best + UMA lifecycle"},"strategy":if app.settings.uma_trade {"rust_uma"} else {"rust_post_propose_winner"}})
     );
     let shutdown = app.clone();
     axum::serve(listener, router)
@@ -1311,6 +1406,8 @@ mod tests {
                 live: None,
                 history_notify: Notify::new(),
                 settings: Settings {
+                    uma_trade: false,
+                    clob_book_url: uma_trade::book_url(),
                     django_url: format!("{url}/context"),
                     history_url: format!("{url}/history"),
                     ober_url: url,
@@ -1356,6 +1453,7 @@ mod tests {
                 exchange,
                 journal: Arc::new(Mutex::new(journal)),
                 slots: Arc::new(Semaphore::new(8)),
+                proposal_queue: Arc::new(Semaphore::new(1024)),
                 notify: Notify::new(),
                 nats_up: AtomicBool::new(true),
                 redis_up: AtomicBool::new(true),
@@ -1445,3 +1543,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "uma_trade_tests.rs"]
+mod uma_trade_tests;
