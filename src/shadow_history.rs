@@ -33,7 +33,7 @@ pub fn payload(entry: &Stored) -> Result<Value> {
         body["uma"] = uma.clone();
     }
     // Old journal entries omit this field, preserving their receipt retry digest.
-    if entry.signal.id.starts_with("live-")
+    if (entry.signal.id.starts_with("live-") || r.uma.is_some())
         && let Some(cash) = r.submitted_amount
     {
         body["submitted_amount"] = json!(cash.normalize().to_string());
