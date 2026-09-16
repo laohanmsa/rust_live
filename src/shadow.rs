@@ -1152,6 +1152,11 @@ async fn metrics(
     } else {
         0
     });
+    result["database_pool"] = app
+        .database
+        .as_ref()
+        .map(|db| db.pool_status())
+        .unwrap_or(Value::Null);
     result["boot_at_ms"] = json!(app.boot_at_ms);
     result["mode"] = json!(app.exchange.mode());
     result["strategy"] = json!(if app.settings.uma_trade {
@@ -1287,6 +1292,16 @@ async fn serve_inner(
         .as_deref()
         .map(|path| crate::postgres_context::PostgresContext::read(Path::new(path), max))
         .transpose()?;
+    if let Some(database) = &database {
+        database
+            .warm_up()
+            .await
+            .context("database pool warm-up failed")?;
+        println!(
+            "{}",
+            json!({"event":"database_pool_warmed","pool":database.pool_status()})
+        );
+    }
     let app = Arc::new(App {
         database,
         live,
@@ -1317,6 +1332,12 @@ async fn serve_inner(
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
     });
+    if app.settings.uma_trade && app.warm_book_connection().await.is_err() {
+        eprintln!(
+            "{}",
+            json!({"event":"book_connection_warm_failed","action":"fetch_on_proposal"})
+        );
+    }
     let mut tasks = vec![
         tokio::spawn(app.clone().uma_loop()),
         tokio::spawn(app.clone().history_loop()),

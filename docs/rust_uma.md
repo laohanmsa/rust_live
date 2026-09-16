@@ -116,3 +116,29 @@ Dashboard now renders the current book beside the saved order book using its exi
 Snapshot reads are always read-only, validate token/side identity, and never fall back to a live book.
 The snapshot label shows its capture time and the elapsed time from collection to submission.
 No second public request is added to the hot path, no duplicate snapshot table is introduced, and prior `rust_uma` orders work without backfill.
+
+## Connection reuse and query planning
+
+Database and public-book clients were already persistent before this optimization.
+The database pool now creates all configured connections, prepares the context and readiness statements, and executes an empty-key context read before accepting proposals.
+Only these read-only sessions use `plan_cache_mode=force_generic_plan`, avoiding PostgreSQL's initial per-execution custom planning for this indexed single-market query.
+Query results are not cached: changed market state, settlements, fees and shutdown flags are read again on every proposal.
+`/metrics` exposes `database_pool` size, availability, waiting requests and configured maximum.
+
+The existing shared HTTP client explicitly enables HTTP/2 support and warms its public exchange connection with one bounded `/time` read at startup.
+The response body is fully drained so the pooled connection can be reused; an exchange warm-up failure logs a diagnostic and leaves the normal bounded book-fetch path available.
+A successful warm-up logs the negotiated protocol.
+Both outcome books still use concurrent GET requests, the existing 90-second idle pool lifetime and normal reconnection behavior.
+No extra public request is added to each proposal, and no periodic external keepalive job is introduced.
+
+A controlled amster-p comparison used the same eight market IDs at concurrency eight, forty reads per variant.
+The original planning policy measured median 5.963 ms / p95 10.639 ms; generic plans measured 2.480 ms / p95 4.388 ms.
+An initial planning/execution inspection found custom planning around 3-5 ms and generic planning around 0.04 ms.
+These are short controlled samples, not a guarantee against load-related database tails.
+
+The official [batch books endpoint](https://docs.polymarket.com/api-reference/market-data/get-order-books-request-body) was compared with parallel GETs using reused connections and three active market pairs.
+Twenty warm samples per variant measured parallel GET median 27.94 ms / p95 31.79 ms, and batch POST median 26.08 ms / p95 33.68 ms.
+Because batch requests did not improve the tail in that sample, the existing parallel path and full per-outcome snapshots were retained.
+Long idle periods or peer disconnects can still require a new transport connection.
+
+Tests verify that startup warming creates all pool sessions, later concurrent queries retain the same backend IDs, generic plans still see changed rows, and a book request reuses the connection opened by the time request.

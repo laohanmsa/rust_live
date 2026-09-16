@@ -49,6 +49,31 @@ fn normalize_book(mut book: Value, token: &str) -> Result<Value, &'static str> {
 }
 
 impl App {
+    pub(super) async fn warm_book_connection(&self) -> Result<()> {
+        let started = Instant::now();
+        let mut response = self
+            .http
+            .get(format!(
+                "{}/time",
+                self.settings.clob_book_url.trim_end_matches('/')
+            ))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?
+            .error_for_status()?;
+        let version = response.version();
+        let mut bytes = 0;
+        while let Some(chunk) = response.chunk().await? {
+            bytes += chunk.len();
+            ensure!(bytes <= 1024, "oversized exchange time response");
+        }
+        println!(
+            "{}",
+            json!({"event":"book_connection_warmed","http_version":format!("{version:?}"),"elapsed_ms":elapsed_ms(started)})
+        );
+        Ok(())
+    }
+
     pub(super) fn dispatch_uma(self: &Arc<Self>, event: crate::uma::Event) {
         self.telemetry.received();
         let received = Instant::now();

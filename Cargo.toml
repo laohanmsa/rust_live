@@ -13,7 +13,7 @@ hmac = "0.12"
 sha2 = "0.10"
 polymarket_client_sdk_v2 = { version = "=0.8.0", features = ["clob"] }
 alloy = { version = "1.6.3", default-features = false, features = ["signer-local", "sol-types"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time"] }

@@ -42,7 +42,24 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     let (current, max_active) = (active.clone(), peak.clone());
     let (c, log) = (context.clone(), calls.clone());
     let (b, book_log) = (books.clone(), calls.clone());
+    let warm_peer = Arc::new(Mutex::new(None));
+    let book_peers = Arc::new(Mutex::new(Vec::new()));
+    let (warm_capture, book_capture) = (warm_peer.clone(), book_peers.clone());
     let router = Router::new()
+        .route(
+            "/time",
+            get(
+                move |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| {
+                    let capture = warm_capture.clone();
+                    async move {
+                        *capture.lock().await = Some(peer);
+                        Json(now_ms() / 1000)
+                    }
+                },
+            ),
+        )
         .route(
             "/context",
             get(move |Query(query): Query<HashMap<String, String>>| {
@@ -68,22 +85,34 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
         )
         .route(
             "/book",
-            get(move |Query(query): Query<HashMap<String, String>>| {
-                let (b, log) = (b.clone(), book_log.clone());
-                async move {
-                    let token = &query["token_id"];
-                    log.lock().await.push(token.clone());
-                    let number = token.parse::<u64>().unwrap();
-                    let template = if number % 2 == 0 { "42" } else { "43" };
-                    let mut book = b.read().await[template].clone();
-                    book["asset_id"] = json!(token);
-                    Json(book)
-                }
-            }),
+            get(
+                move |Query(query): Query<HashMap<String, String>>,
+                      axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| {
+                    let (b, log, capture) = (b.clone(), book_log.clone(), book_capture.clone());
+                    async move {
+                        capture.lock().await.push(peer);
+                        let token = &query["token_id"];
+                        log.lock().await.push(token.clone());
+                        let number = token.parse::<u64>().unwrap();
+                        let template = if number % 2 == 0 { "42" } else { "43" };
+                        let mut book = b.read().await[template].clone();
+                        book["asset_id"] = json!(token);
+                        Json(book)
+                    }
+                },
+            ),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
-    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let mock = demo::MockExchange::start().await?;
     let exchange = Exchange::shadow(&mock.url).await?;
     let path =
@@ -122,6 +151,7 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
         boot_at_ms: now,
         http: reqwest::Client::new(),
     });
+    app.warm_book_connection().await?;
     let event = crate::uma::Event {
         channel: "uma:resolution".into(),
         market_id: "123".into(),
@@ -236,6 +266,11 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     app.redis_epoch.store(2, Ordering::SeqCst);
     app.receive_uma(event, Instant::now(), 1).await;
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 9);
+    let warmed = warm_peer.lock().await.context("warm request missing")?;
+    assert!(
+        book_peers.lock().await.contains(&warmed),
+        "book request must reuse the warmed connection"
+    );
     server.abort();
     Ok(())
 }
