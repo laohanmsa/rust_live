@@ -11,3 +11,6 @@
 
 !scripts/
 !scripts/monitor.py
+!deploy/uma-trader.json
+!deploy/uma-dry-run.json
+!sql/**
