@@ -214,6 +214,7 @@ struct LiveAccount {
 }
 
 struct App {
+    control: Arc<crate::trading_control::TradingControl>,
     database: Option<crate::postgres_context::PostgresContext>,
     live: Option<LiveAccount>,
     history_notify: Notify,
@@ -243,6 +244,14 @@ impl App {
                 "{}",
                 json!({"event":"trading_stopped","reason":reason,"at_ms":now_ms()})
             );
+        }
+    }
+
+    fn mode(&self) -> &'static str {
+        if self.live.is_some() && self.control.dry_run() {
+            "dry_run"
+        } else {
+            self.exchange.mode()
         }
     }
 
@@ -1074,6 +1083,10 @@ impl App {
         if !valid || now_ms().saturating_sub(source_ms) > self.settings.max_signal_age_ms {
             r.state = "blocked".into();
             r.reason = "state_changed_or_expired_before_submit".into();
+        } else if self.live.is_some() && self.control.dry_run() {
+            // Signing and durable simulation evidence continue, but never call the exchange.
+            r.state = "dry_run".into();
+            r.reason = "dashboard_dry_run_or_control_unavailable".into();
         } else {
             r.submitted_at_ms = Some(now_ms());
             r.dispatch_ms = Some(elapsed_ms(received));
@@ -1129,7 +1142,7 @@ struct Window {
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     let data = app.data.read().await;
     Json(
-        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"stop_reason":*app.stop_reason.lock().expect("stop reason mutex"),"data_sources":if app.settings.uma_trade {"Django + shared UMA + Polymarket books"} else {"Django + UMA + OBer"},"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
+        json!({"mode":app.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"stop_reason":*app.stop_reason.lock().expect("stop reason mutex"),"data_sources":if app.settings.uma_trade {"Django + shared UMA + Polymarket books"} else {"Django + UMA + OBer"},"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
     )
 }
 async fn metrics(
@@ -1158,7 +1171,9 @@ async fn metrics(
         .map(|db| db.pool_status())
         .unwrap_or(Value::Null);
     result["boot_at_ms"] = json!(app.boot_at_ms);
-    result["mode"] = json!(app.exchange.mode());
+    result["mode"] = json!(app.mode());
+    result["dashboard_dry_run"] = json!(app.control.dry_run());
+    result["dashboard_dry_run_latched"] = json!(app.control.latched());
     result["strategy"] = json!(if app.settings.uma_trade {
         "rust_uma"
     } else {
@@ -1303,6 +1318,7 @@ async fn serve_inner(
         );
     }
     let app = Arc::new(App {
+        control: Arc::default(),
         database,
         live,
         history_notify: Notify::new(),
@@ -1339,6 +1355,11 @@ async fn serve_inner(
         );
     }
     let mut tasks = vec![
+        tokio::spawn(app.control.clone().run(
+            app.settings.nats_url.clone(),
+            app.settings.django_url.clone(),
+            app.http.clone(),
+        )),
         tokio::spawn(app.clone().uma_loop()),
         tokio::spawn(app.clone().history_loop()),
     ];
@@ -1366,7 +1387,7 @@ async fn serve_inner(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!(
         "{}",
-        json!({"mode":app.exchange.mode(),"account":app.live.as_ref().map(|a|&a.name),"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"},"subscribed":if app.settings.uma_trade {"rust.uma.events"} else {"ober.*.best + UMA lifecycle"},"strategy":if app.settings.uma_trade {"rust_uma"} else {"rust_post_propose_winner"}})
+        json!({"mode":app.mode(),"account":app.live.as_ref().map(|a|&a.name),"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"},"subscribed":if app.settings.uma_trade {"rust.uma.events"} else {"ober.*.best + UMA lifecycle"},"strategy":if app.settings.uma_trade {"rust_uma"} else {"rust_post_propose_winner"}})
     );
     let shutdown = app.clone();
     axum::serve(listener, router)
@@ -1434,7 +1455,12 @@ mod tests {
     #[tokio::test]
     async fn first_signal_with_no_cached_valuation_submits_independently_of_live_quota()
     -> Result<()> {
-        for native in [false, true] {
+        for (native, dashboard_dry_run, latched) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
             let now = now_ms();
             let page = json!({"schema_version":1,"captured_at_ms":now,"has_more":false,"next_after_id":null,
             "config":{"valuation_key":"m5_expected_payout","manual_trade_shutdown_enabled":false,"strategy_enabled":true,
@@ -1468,8 +1494,15 @@ mod tests {
                 .join(format!("shadow-parity-{}-{now}.jsonl", std::process::id()));
             let journal = Journal::open(&path, &exchange.scope())?;
             let app = Arc::new(App {
+                control: Arc::default(),
                 database: None,
-                live: None,
+                live: dashboard_dry_run.then_some(LiveAccount {
+                    name: "synthetic".into(),
+                    id: 1,
+                    signer: String::new(),
+                    funder: String::new(),
+                    token: String::new(),
+                }),
                 history_notify: Notify::new(),
                 settings: Settings {
                     uma_trade: false,
@@ -1510,6 +1543,7 @@ mod tests {
                     } else {
                         Vec::new()
                     },
+                    live_ready_at_ms: now,
                     last_sync_ms: now,
                     synced_epoch: Some(1),
                     native_uma_at_ms: now,
@@ -1530,6 +1564,14 @@ mod tests {
                 boot_at_ms: now,
                 http: reqwest::Client::new(),
             });
+            if latched {
+                app.control.confirm_snapshot(&serde_json::to_vec(&json!({
+                    "schema_version":1,"source":"dashboard","dry_run_enabled":false,"triggered_at_ms":now_ms()
+                }))?)?;
+                app.control.apply(&serde_json::to_vec(&json!({
+                    "schema_version":1,"source":"dashboard","dry_run_enabled":true,"triggered_at_ms":now_ms()
+                }))?)?;
+            }
             if native {
                 app.data.write().await.lifecycle.apply("uma:resolution",&json!({"market_id":"test-market","request_id":"r","block_number":10,"proposed_price":1,"block_timestamp":now/1000}));
             }
@@ -1548,6 +1590,29 @@ mod tests {
             )
             .await;
             let permits = app.slots.acquire_many(8).await?;
+            if dashboard_dry_run {
+                assert_eq!(
+                    mock.state.posts.load(Ordering::SeqCst),
+                    0,
+                    "unknown dashboard control must never submit a real order"
+                );
+                let id = format!("live-{:x}", Sha256::digest(serde_json::to_vec(&book)?));
+                let ledger = app.journal.lock().await;
+                let result = ledger.get(&id)?.unwrap().reply;
+                assert_eq!(result.state, "dry_run");
+                assert!(result.order_hash.is_some());
+                assert!(result.submitted_at_ms.is_none());
+                assert_eq!(ledger.unresolved_count()?, 0);
+                assert_eq!(ledger.pending_count()?, 0);
+                assert_eq!(health(State(app.clone())).await.0["mode"], "dry_run");
+                drop(ledger);
+                server.abort();
+                drop(permits);
+                drop(app);
+                std::fs::remove_file(path.with_extension("history-acks.jsonl"))?;
+                std::fs::remove_file(path)?;
+                continue;
+            }
             assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
             let id = format!("shadow-{:x}", Sha256::digest(serde_json::to_vec(&book)?));
             assert_eq!(

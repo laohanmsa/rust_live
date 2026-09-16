@@ -8,6 +8,7 @@ pub mod shadow_history;
 pub mod shadow_state;
 pub mod shadow_valuation;
 pub mod telemetry;
+pub mod trading_control;
 pub mod uma;
 
 use anyhow::{Result, ensure};

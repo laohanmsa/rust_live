@@ -447,3 +447,21 @@ The `rust_uma` lane shares the existing UMA service, queries Dashboard on each p
 Its receipts include both book snapshots and per-stage timings in Dashboard.
 See [rust_uma implementation and activation](docs/rust_uma.md) and `deploy/compose.uma.yaml`.
 The lane is disabled until an independent account and the compatible Dashboard receipt endpoint are configured.
+
+### Dashboard global dry run
+
+Both execution lanes independently subscribe to `trading.control.dry_run` on the configured NATS broker.
+The payload is `{"schema_version":1,"source":"dashboard","dry_run_enabled":true,"triggered_at_ms":1789600000000}`.
+An enabled message latches the current process into dry run; false messages never enable live trading.
+The same-origin `/api/trading-control/` snapshot is checked at startup and every five seconds, after subscribing, to repair lost messages.
+Until a fresh snapshot is available, or when the control connection fails, new live submissions are disabled.
+Snapshots older than fifteen seconds are rejected.
+This task starts for both lanes, including `rust_uma`, which has no OBer subscription.
+
+The shared final submission check still signs and journals simulated orders as `dry_run`, without an exchange request or live-history export.
+These forced simulations remain in the local durable journal and metrics; existing fixed-shadow execution keeps its mock and dashboard simulation receipts.
+Health reports `mode=dry_run` for a live-configured process under this guard, and metrics expose `dashboard_dry_run` and `dashboard_dry_run_latched`.
+Already submitted orders continue receipt processing.
+To recover a latched live process, disable dashboard dry run and explicitly restart it under the normal trading authorization.
+Deploy the dashboard publisher and snapshot endpoint before this consumer.
+The isolated broker regression is `RUST_CONTROL_TEST_NATS_URL=nats://127.0.0.1:4222 cargo test --locked --test trading_control -- --ignored` and is included in the existing Rust checks workflow.
