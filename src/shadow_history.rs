@@ -103,3 +103,77 @@ async fn export(
     }
     Ok(count)
 }
+
+/// Read the account-scoped failure decision; never resubmit an exchange order.
+pub async fn resolve_unknown_once(
+    http: &reqwest::Client,
+    url: &str,
+    journal: &Arc<Mutex<Journal>>,
+    account: &str,
+    token: &str,
+) -> Result<usize> {
+    let ledger = journal.clone();
+    let cutoff = crate::now_ms().saturating_sub(300_000);
+    let batch =
+        tokio::task::spawn_blocking(move || ledger.blocking_lock().unknown_batch(cutoff)).await??;
+    let mut count = 0;
+    for entry in batch {
+        let hash = entry
+            .reply
+            .order_hash
+            .as_deref()
+            .context("unknown order hash missing")?;
+        let response: Value = http
+            .get(url)
+            .bearer_auth(token)
+            .query(&[("order_hash", hash)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        ensure!(
+            response["account_name"] == account
+                && response["signal_id"] == entry.signal.id
+                && response["order_hash"] == hash,
+            "invalid reconciliation identity"
+        );
+        let failed =
+            response["status"] == "FAILED" && response["failure_policy"] == "no_activity_after_5m";
+        let filled = matches!(response["status"].as_str(), Some("FILLED" | "PARTIAL"))
+            && response["confirmed_fill"] == true;
+        if !failed && !filled {
+            continue;
+        }
+        let ledger = journal.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ledger = ledger.blocking_lock();
+            let Some(current) = ledger.get(&entry.signal.id)? else {
+                anyhow::bail!("order missing");
+            };
+            if current.reply.state != "unknown" {
+                return Ok::<bool, anyhow::Error>(false);
+            }
+            ensure!(
+                current.reply.order_hash == entry.reply.order_hash,
+                "order hash changed"
+            );
+            let mut reply = current.reply;
+            reply.state = if failed { "rejected" } else { "accepted" }.into();
+            reply.reason = if failed {
+                "no_activity_after_5m: Dashboard failure policy"
+            } else {
+                "reconciled_confirmed_fill"
+            }
+            .into();
+            if filled {
+                reply.exchange_status = Some("matched".into());
+            }
+            ledger.finish(reply)?;
+            Ok(true)
+        })
+        .await??;
+        count += 1;
+    }
+    Ok(count)
+}
