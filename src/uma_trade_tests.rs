@@ -127,6 +127,7 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
         "uma_trade":true,"clob_book_url":url
     }))?;
     let app = Arc::new(App {
+        control: Arc::default(),
         database: None,
         live: None,
         history_notify: Notify::new(),
