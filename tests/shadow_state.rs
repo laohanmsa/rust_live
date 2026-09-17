@@ -67,6 +67,35 @@ fn guards_use_cached_context_and_keep_threshold_boundaries() -> anyhow::Result<(
         test("0.90", "100", tagged),
         Some("block_restricted_event_tags")
     );
+    for question in [
+        "Hipfl vs. Salazar: Match O/U 21.5",
+        "Forti/Romano vs. Clarke/Gill: Match O/U 22.5",
+        "A vs. B: Set 1 Games O/U 9.5",
+        "A vs. B: Set 2 Games O/U 10.5",
+        "A vs. B: Total Sets O/U 2.5",
+    ] {
+        let mut tennis = context.clone();
+        tennis.question = question.into();
+        tennis.tags = vec![" Tennis ".into()];
+        assert_eq!(test("0.52", "100", tennis), Some("tennis_ou_paused"));
+    }
+    for kind in [
+        "tennis_match_totals",
+        "tennis_first_set_totals",
+        "tennis_set_games_totals",
+        "tennis_set_totals",
+    ] {
+        let mut typed = context.clone();
+        typed.sports_market_type = kind.into();
+        assert_eq!(test("0.52", "100", typed), Some("tennis_ou_paused"));
+    }
+    let mut tennis_winner = context.clone();
+    tennis_winner.tags = vec!["Tennis".into()];
+    assert_eq!(test("0.52", "100", tennis_winner), None);
+    let mut basketball = context.clone();
+    basketball.question = "A vs B: O/U 220.5".into();
+    basketball.tags = vec!["Basketball".into()];
+    assert_eq!(test("0.52", "100", basketball), None);
     let mut disputed = context.clone();
     disputed.has_disputed_resolution = true;
     assert_eq!(test("0.90", "100", disputed), Some("market_not_disputed"));

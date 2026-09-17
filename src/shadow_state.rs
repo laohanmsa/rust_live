@@ -236,6 +236,8 @@ pub struct Valuation {
 pub struct MarketContext {
     pub market_id: String,
     pub question: String,
+    #[serde(default)]
+    pub sports_market_type: String,
     pub market_volume: Option<Decimal>,
     pub event_volume: Option<Decimal>,
     pub tags: Vec<String>,
@@ -373,6 +375,16 @@ pub fn decide(
         .any(|t| ["middle east", "israel", "trump"].contains(&t.trim().to_lowercase().as_str()))
     {
         return Err("block_restricted_event_tags");
+    }
+    let kind = context.sports_market_type.trim().to_ascii_lowercase();
+    if (kind.starts_with("tennis_") && kind.ends_with("_totals"))
+        || (context.question.to_ascii_lowercase().contains("o/u")
+            && context
+                .tags
+                .iter()
+                .any(|tag| tag.trim().eq_ignore_ascii_case("tennis")))
+    {
+        return Err("tennis_ou_paused");
     }
     if context.has_disputed_resolution || lifecycle.has_dispute(&context.market_id) {
         return Err("market_not_disputed");

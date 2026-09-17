@@ -468,3 +468,11 @@ Already submitted orders continue receipt processing.
 To recover a latched live process, disable dashboard dry run and explicitly restart it under the normal trading authorization.
 Deploy the dashboard publisher and snapshot endpoint before this consumer.
 The isolated broker regression is `RUST_CONTROL_TEST_NATS_URL=nats://127.0.0.1:4222 cargo test --locked --test trading_control -- --ignored` and is included in the existing Rust checks workflow.
+
+## 网球 O/U 暂停（2026-09-17）
+
+OBer 与 UMA 两条路径在共用决策 guard 中拒绝网球总局数、分盘局数及总盘数大小盘，原因码为 `tennis_ou_paused`。
+优先使用上下文中的 `sports_market_type`，缺少类型时用 Tennis 标签和 O/U 标题识别。
+Django API 提供市场类型；PostgreSQL 路径使用已有 Tennis 标签和 O/U 标题，不扩大数据库读取权限。
+胜负盘、让盘与其他体育大小盘不受影响。
+这是临时无条件暂停，恢复需要明确修改并部署代码，不随 live/dry-run 开关解除。
