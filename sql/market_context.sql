@@ -7,7 +7,6 @@ WITH fee_schedules(key, rate, exponent) AS (VALUES
 )
 SELECT jsonb_build_object(
  'market_id',m.id,'question',m.question,'market_volume',m.volume::text,'event_volume',e.volume::text,
- 'sports_market_type',COALESCE(m.raw_data->>'sportsMarketType',''),
  'tags',COALESCE((SELECT jsonb_agg(t.label ORDER BY t.id) FROM market_data_event_tags et JOIN market_data_tag t ON t.id=et.tag_id WHERE et.event_id=e.id),'[]'::jsonb),
  'eligible',false,'token_id_yes',m.token_id_yes,'token_id_no',m.token_id_no,
  'active',m.active,'closed',m.closed,'accepting_orders',m.accepting_orders,'auto_archived',m.auto_archived,
