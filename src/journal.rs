@@ -247,6 +247,18 @@ impl Journal {
                 })?;
         Ok(count.try_into()?)
     }
+    /// Bounded post-submit reconciliation, including already exported unknown receipts.
+    pub fn unknown_batch(&self, before: u64) -> Result<Vec<Stored>> {
+        let mut query = self.index.prepare(
+            "SELECT id FROM orders WHERE state='unknown' AND observed<=?1 ORDER BY observed LIMIT 50",
+        )?;
+        let ids = query
+            .query_map([i64::try_from(before)?], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| self.get(&id)?.context("unknown order missing"))
+            .collect()
+    }
     pub fn unresolved_count(&self) -> Result<usize> {
         let count: i64 = self.index.query_row(
             "SELECT count(*) FROM orders WHERE state IN ('unknown','prepared')",

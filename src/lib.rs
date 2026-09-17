@@ -329,7 +329,7 @@ impl Service {
             "journal already exceeds configured budget"
         );
         let markets = exchange.warm(&config.tokens).await?;
-        let stopped = Arc::new(AtomicBool::new(journal.unresolved_count()? > 0));
+        let stopped = Arc::new(AtomicBool::new(false));
         let context = Arc::new(ContextState {
             telemetry: telemetry::Telemetry::default(),
             boot_at_ms: now_ms(),
@@ -613,9 +613,6 @@ async fn process(ctx: Arc<ContextState>, s: &Signal, received: Instant) -> Reply
             apply_exchange_response(&mut result, status, &body);
         }
         result.post_ms = Some(elapsed_ms(post_start));
-        if result.state == "unknown" {
-            ctx.stopped.store(true, Ordering::SeqCst);
-        }
     }
     result.total_ms = elapsed_ms(received);
     let ledger = ctx.journal.clone();

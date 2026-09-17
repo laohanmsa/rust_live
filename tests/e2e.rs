@@ -158,7 +158,7 @@ async fn http_signature_deduplication_policy_budget_and_restart() -> anyhow::Res
 }
 
 #[tokio::test]
-async fn timeout_never_retries_and_keeps_budget_and_stop_across_restart() -> anyhow::Result<()> {
+async fn timeout_isolates_order_and_keeps_budget_across_restart() -> anyhow::Result<()> {
     let mock = demo::MockExchange::start().await?;
     mock.state.delay_ms.store(1500, Ordering::SeqCst);
     let dir = directory();
@@ -198,14 +198,16 @@ async fn timeout_never_retries_and_keeps_budget_and_stop_across_restart() -> any
     let result = first.await?;
     assert_eq!(result["state"], "unknown");
     assert_eq!(app.send(&original).await?["state"], "unknown");
-    assert_eq!(app.send(&demo::signal("after")).await?["reason"], "stopped");
+    mock.state.delay_ms.store(0, Ordering::SeqCst);
+    assert_eq!(app.send(&demo::signal("after")).await?["state"], "accepted");
     app.close().await?;
     let app = Fixture::start(cfg, &mock).await?;
     assert_eq!(
-        app.send(&demo::signal("after-restart")).await?["reason"],
-        "stopped"
+        app.send(&demo::signal("after-restart")).await?["state"],
+        "accepted"
     );
-    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(app.send(&original).await?["state"], "unknown");
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 3);
     app.close().await?;
     std::fs::remove_dir_all(dir)?;
     Ok(())
@@ -262,8 +264,8 @@ async fn crash_after_preparation_recovers_unknown_without_resending() -> anyhow:
     std::fs::write(&path, prepared)?;
     let app = Fixture::start(cfg, &mock).await?;
     assert_eq!(app.send(&s).await?["state"], "unknown");
-    assert_eq!(app.send(&demo::signal("new")).await?["reason"], "stopped");
-    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(app.send(&demo::signal("new")).await?["state"], "accepted");
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 2);
     app.close().await?;
     std::fs::remove_dir_all(dir)?;
     Ok(())

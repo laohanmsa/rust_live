@@ -58,8 +58,27 @@ class MonitorTest(unittest.TestCase):
         s['metrics']['history']['journal_entries']=800000
         self.assertIn('journal_capacity',issues(s,1000))
 
+    def test_inflight_submission_recovers_without_unknown_notification(self):
+        s=self.snapshot();s['metrics']['history']['unresolved']=1
+        state={};found=issues(s,1000)
+        self.assertEqual(transitions(state,found,1000),[])
+        self.assertEqual(transitions(state,{},1015),[])
+        self.assertEqual(transitions(state,{},1045),[])
+        self.assertEqual(state['incidents'],{})
+
+    def test_persistent_unresolved_submission_alerts_and_halt_escalates(self):
+        s=self.snapshot();s['metrics']['history']['unresolved']=1
+        state={};found=issues(s,1000)
+        self.assertEqual(transitions(state,found,1000),[])
+        self.assertEqual(transitions(state,found,1015),[])
+        self.assertEqual(transitions(state,found,1030)[0][0],'unknown_order')
+        s['trader'].update(stopped=True,ready=False,stop_reason='submission_uncertain')
+        notices=transitions({},issues(s,1000),1000)
+        self.assertEqual({n[0] for n in notices},{'trading_stopped','unknown_order'})
+
     def test_stale_uma_and_unknown_orders_are_detected(self):
         s=self.snapshot();s['uma']['scan_age_ms']=11000
+        s['trader'].update(stopped=True,ready=False,stop_reason='submission_uncertain')
         s['metrics']['history']['unresolved']=1
         found=issues(s,1000)
         self.assertIn('uma_unhealthy',found)

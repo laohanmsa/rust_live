@@ -30,7 +30,9 @@ def issues(snapshot, now):
     if sources.get('context_age_ms',0) > 90000:
         out['context_stale'] = (0, 'Django 市场资料已过期')
     if history.get('unresolved',0):
-        out['unknown_order'] = (0, '存在结果未知的提交，需要先核对成交，不能直接重启重发')
+        # unresolved includes normal in-flight prepared orders; real uncertainty halts trading.
+        delay = 0 if trader.get('stopped') is True else 30
+        out['unknown_order'] = (delay, '存在待核对订单；其他订单继续交易，五分钟后自动检查成交，原单不会重发')
     if history.get('pending',0) or history.get('error'):
         out['history_backlog'] = (60, '订单历史同步持续积压或失败')
     if history.get('journal_entries',0) >= .8 * history.get('journal_capacity',50000):

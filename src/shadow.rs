@@ -260,6 +260,26 @@ impl App {
             .as_ref()
             .map_or(demo::ACCESS, |a| a.token.as_str())
     }
+    async fn reconciliation_loop(self: Arc<Self>) {
+        let Some(account) = &self.live else {
+            return;
+        };
+        loop {
+            if crate::shadow_history::resolve_unknown_once(
+                &self.http,
+                &self.settings.history_url,
+                &self.journal,
+                &account.name,
+                &account.token,
+            )
+            .await
+            .is_err()
+            {
+                eprintln!("unknown_order_reconciliation_failed_retrying");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
     async fn history_loop(self: Arc<Self>) {
         loop {
             if let Some(database) = &self.database {
@@ -1097,9 +1117,7 @@ impl App {
             match tokio::time::timeout(Duration::from_secs(5), self.exchange.post(signed)).await {
                 Ok(Ok((status, body))) if self.live.is_some() => {
                     crate::apply_exchange_response(&mut r, status, &body);
-                    if r.state == "unknown" {
-                        self.halt("submission_uncertain");
-                    } else if [401, 403].contains(&status) {
+                    if [401, 403].contains(&status) {
                         self.halt("exchange_auth_rejected");
                     }
                 }
@@ -1113,7 +1131,6 @@ impl App {
                 _ => {
                     r.state = "unknown".into();
                     r.reason = "submission_uncertain".into();
-                    self.halt("submission_uncertain");
                 }
             }
             r.post_ms = Some(elapsed_ms(started));
@@ -1298,7 +1315,6 @@ async fn serve_inner(
         token: c.access_token,
     });
     let journal = Journal::open(Path::new(&settings.journal), &exchange.scope())?;
-    let stopped = journal.unresolved_count()? > 0;
     let restore = journal.recent_orders(now_ms().saturating_sub(10_800_000))?;
     let bind = settings.bind.clone();
     let max = settings.max_inflight;
@@ -1336,8 +1352,8 @@ async fn serve_inner(
         nats_up: AtomicBool::new(false),
         redis_up: AtomicBool::new(false),
         redis_epoch: AtomicU64::new(0),
-        stopped: AtomicBool::new(stopped),
-        stop_reason: std::sync::Mutex::new(stopped.then_some("unconfirmed_journal")),
+        stopped: AtomicBool::new(false),
+        stop_reason: std::sync::Mutex::new(None),
         boot_at_ms: now_ms(),
         http: reqwest::Client::builder()
             .no_proxy()
@@ -1362,6 +1378,7 @@ async fn serve_inner(
         )),
         tokio::spawn(app.clone().uma_loop()),
         tokio::spawn(app.clone().history_loop()),
+        tokio::spawn(app.clone().reconciliation_loop()),
     ];
     if !app.settings.uma_trade {
         tasks.push(tokio::spawn(app.clone().nats_loop()));
@@ -1455,11 +1472,12 @@ mod tests {
     #[tokio::test]
     async fn first_signal_with_no_cached_valuation_submits_independently_of_live_quota()
     -> Result<()> {
-        for (native, dashboard_dry_run, latched) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, false),
-            (true, true, true),
+        for (native, dashboard_dry_run, latched, uncertain) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            (false, false, false, true),
         ] {
             let now = now_ms();
             let page = json!({"schema_version":1,"captured_at_ms":now,"has_more":false,"next_after_id":null,
@@ -1489,6 +1507,9 @@ mod tests {
             let url = format!("http://{}", listener.local_addr()?);
             let server = tokio::spawn(async move { axum::serve(listener, router).await });
             let mock = demo::MockExchange::start().await?;
+            if uncertain {
+                mock.state.response_code.store(500, Ordering::SeqCst);
+            }
             let exchange = Exchange::shadow(&mock.url).await?;
             let path = std::env::temp_dir()
                 .join(format!("shadow-parity-{}-{now}.jsonl", std::process::id()));
@@ -1617,8 +1638,9 @@ mod tests {
             let id = format!("shadow-{:x}", Sha256::digest(serde_json::to_vec(&book)?));
             assert_eq!(
                 app.journal.lock().await.get(&id)?.unwrap().reply.state,
-                "accepted"
+                if uncertain { "unknown" } else { "accepted" }
             );
+            assert!(!app.stopped.load(Ordering::SeqCst));
             assert_eq!(
                 app.journal
                     .lock()

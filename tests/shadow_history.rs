@@ -128,3 +128,87 @@ async fn signed_mock_order_retries_history_and_recovers_ack_without_resubmission
     std::fs::remove_file(path)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn unknown_resolution_requires_matching_identity_and_preserves_reservation() -> Result<()> {
+    use polym_rust_demo::shadow_history::resolve_unknown_once;
+    let mock = demo::MockExchange::start().await?;
+    let exchange = Exchange::shadow(&mock.url).await?;
+    let mut signal = demo::signal(&format!("live-{}", "c".repeat(64)));
+    signal.token_id = "42".parse()?;
+    signal.observed_at_ms -= 301_000;
+    let signed = exchange
+        .sign_shadow(&signal, "10".parse()?, "0.01".parse()?, false)
+        .await?;
+    let reply = serde_json::from_value(json!({
+        "id":signal.id,"state":"unknown","reason":"submission_uncertain","order_hash":signed.hash,
+        "exchange_status":null,"policy_ms":0.1,"post_ms":null,"finalize_ms":null,
+        "source_to_dispatch_ms":3.0,"queue_ms":0.1,"sign_ms":0.2,"journal_ms":0.3,
+        "dispatch_ms":0.7,"total_ms":52.0
+    }))?;
+    let path =
+        std::env::temp_dir().join(format!("unknown-resolution-{}.jsonl", std::process::id()));
+    let scope = exchange.scope();
+    let mut journal = Journal::open(&path, &scope)?;
+    journal.prepare(
+        Stored {
+            signal: signal.clone(),
+            reserved: "10".parse()?,
+            order: signed.journal_order,
+            reply,
+        },
+        None,
+    )?;
+    journal.ack_history(&signal.id)?;
+    let journal = Arc::new(Mutex::new(journal));
+    let body = Arc::new(Mutex::new(
+        json!({"account_name":"wrong", "signal_id":signal.id,
+        "order_hash":signed.hash,"status":"FAILED","failure_policy":"no_activity_after_5m"}),
+    ));
+    let current = body.clone();
+    let router = Router::new().route(
+        "/history",
+        axum::routing::get(move || {
+            let current = current.clone();
+            async move { Json(current.lock().await.clone()) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/history", listener.local_addr()?);
+    let task = tokio::spawn(async move { axum::serve(listener, router).await });
+    let http = reqwest::Client::new();
+    assert!(
+        resolve_unknown_once(&http, &url, &journal, "synthetic", "test")
+            .await
+            .is_err()
+    );
+    assert_eq!(journal.lock().await.unresolved_count()?, 1);
+    body.lock().await["account_name"] = json!("synthetic");
+    body.lock().await["status"] = json!("REVIEW");
+    assert_eq!(
+        resolve_unknown_once(&http, &url, &journal, "synthetic", "test").await?,
+        0
+    );
+    body.lock().await["status"] = json!("FAILED");
+    assert_eq!(
+        resolve_unknown_once(&http, &url, &journal, "synthetic", "test").await?,
+        1
+    );
+    assert_eq!(
+        resolve_unknown_once(&http, &url, &journal, "synthetic", "test").await?,
+        0
+    );
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 0);
+    drop(journal);
+    let recovered = Journal::open(&path, &scope)?;
+    assert_eq!(recovered.unresolved_count()?, 0);
+    assert_eq!(recovered.used, "10".parse()?);
+    assert_eq!(recovered.count, 1);
+    assert_eq!(recovered.exported_count, 1);
+    assert_eq!(recovered.get(&signal.id)?.unwrap().reply.state, "rejected");
+    task.abort();
+    drop(recovered);
+    std::fs::remove_file(path.with_extension("history-acks.jsonl"))?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}
