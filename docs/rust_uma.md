@@ -134,7 +134,9 @@ No extra public request is added to each proposal, and no periodic external keep
 A controlled amster-p comparison used the same eight market IDs at concurrency eight, forty reads per variant.
 The original planning policy measured median 5.963 ms / p95 10.639 ms; generic plans measured 2.480 ms / p95 4.388 ms.
 An initial planning/execution inspection found custom planning around 3-5 ms and generic planning around 0.04 ms.
-These are short controlled samples, not a guarantee against load-related database tails.
+Reversing trial order measured generic-plan median 3.090 ms / p95 55.322 ms and auto-plan median 5.552 ms / p95 8.593 ms.
+The median benefit reproduced, but tail latency did not improve consistently across these short trials.
+These are controlled short samples, not a guarantee against occasional slow requests.
 
 The official [batch books endpoint](https://docs.polymarket.com/api-reference/market-data/get-order-books-request-body) was compared with parallel GETs using reused connections and three active market pairs.
 Twenty warm samples per variant measured parallel GET median 27.94 ms / p95 31.79 ms, and batch POST median 26.08 ms / p95 33.68 ms.
