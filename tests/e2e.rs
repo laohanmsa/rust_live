@@ -160,13 +160,17 @@ async fn http_signature_deduplication_policy_budget_and_restart() -> anyhow::Res
 #[tokio::test]
 async fn timeout_never_retries_and_keeps_budget_and_stop_across_restart() -> anyhow::Result<()> {
     let mock = demo::MockExchange::start().await?;
-    mock.state.delay_ms.store(300, Ordering::SeqCst);
+    mock.state.delay_ms.store(1500, Ordering::SeqCst);
     let dir = directory();
     let mut cfg = demo::config(dir.join("orders.jsonl").to_string_lossy().into());
-    cfg.request_timeout_ms = 100;
+    // Exercise exchange timeout, independently of a loaded runner's scheduling delay.
+    cfg.max_signal_age_ms = 5000;
+    cfg.request_timeout_ms = 500;
     cfg.max_inflight = 1;
     let app = Fixture::start(cfg.clone(), &mock).await?;
-    let original = demo::signal("uncertain");
+    let mut original = demo::signal("uncertain");
+    // A modest scheduling delay must still reach the exchange-timeout path.
+    original.observed_at_ms -= 250;
     let c = app.client.clone();
     let url = app.url.clone();
     let s = original.clone();
@@ -181,12 +185,15 @@ async fn timeout_never_retries_and_keeps_budget_and_stop_across_restart() -> any
             .await
             .unwrap()
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
         while mock.state.posts.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
-    .await?;
+    .await;
+    if dispatched.is_err() {
+        anyhow::bail!("mock saw no request; first response: {}", first.await?);
+    }
     assert_eq!(app.send(&demo::signal("busy")).await?["state"], "busy");
     let result = first.await?;
     assert_eq!(result["state"], "unknown");
