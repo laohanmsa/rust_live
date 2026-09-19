@@ -1,17 +1,19 @@
 # rust_uma proposal lane
 
-This is a second process with a separate account, journal, receipt strategy and execution limit.
+This is a second process with its own journal, receipt strategy and execution limit.
+The live account is explicitly authorized as `airdrop_224`, shared with the original trader without cash reservation.
 The original trader keeps its existing book-driven behavior.
 Both processes subscribe independently to the existing `rust.uma.events` subject and read the same UMA service snapshot on connection or recovery.
 No second oracle listener is created.
-The dry-run lane uses a dedicated PostgreSQL read-only role and a bounded pool of eight connections.
+The lane uses a dedicated PostgreSQL read-only role and a bounded pool of eight connections.
 
 ## Processing
 
 1. Accept a fresh binary proposal from the shared sequenced feed.
 2. Read market context and strategy policy directly from PostgreSQL in one parameterized statement.
    Missing database rows are logged as `database_market_missing` and skipped without hydration or retry.
-3. Fetch winner and opposite `/book?token_id=...` responses concurrently from Polymarket with a persistent request client.
+3. Fetch winner and opposite `/book/<token>` responses concurrently from OBer with a persistent request client.
+   Confirm each book with the trust-gated `/book/<token>/best` endpoint; reject a changed or untrusted quote.
    The opposite best bid is required by the existing M5 valuation.
    Sort and validate the returned levels; do not assume response ordering.
 4. Require a winner ask, then run the shared lifecycle, market status, tag, dispute, price, tick, ask-wall, fee, local M5, market-count and cooldown checks.
@@ -24,7 +26,7 @@ The budgets match the deployed Rust live configuration: below 0.05 uses 5; 0.05 
 The configured per-order ceiling is 30.
 As in Rust live, shares are floored after including the estimated fee, then signed cash is truncated to cents; actual signed cash can be below the selected budget.
 For example, with no fee, a 0.90 ask selects budget 10, plans 11 shares and submits 9.90 cash.
-The price limit is the observed best winner ask.
+The limit price is the observed best winner ask, which must not exceed the UMA-specific 0.998 ceiling or a stricter configured strategy limit.
 Orders below the maintained minimum share size are skipped.
 The displayed requested shares come from the actual signed order, including the exchange client's rounding.
 
@@ -39,14 +41,14 @@ These limits do not assert that an order book request always takes 30 ms.
 The new lane reads an authoritative snapshot on initial connection and after sequence gaps, resets or feed epoch changes.
 It does not dispatch historical proposals from snapshots.
 Unlike the book-driven lane, it does not periodically replace the feed cursor with a snapshot while connected, since doing so could swallow live proposal triggers.
-Uncertain submissions stop further orders; they are never automatically resubmitted.
+Uncertain submissions are isolated and reconciled using the existing account-scoped history path; the original order is never automatically resubmitted.
 The final check revalidates the lifecycle identity, feed epoch, account readiness, stop flags and signal lifetime immediately before submission.
 A recovered journal restores market quotas and prevents resubmission of an already prepared proposal.
 
 ## Observation
 
-Per-order evidence includes the complete validated winner/opposite snapshots, their exchange timestamps, proposal identity, maintained market context, applied policy, expected payout and signed cash.
-The receipt carries queue wait, Django lookup, each OBer book request, parallel book wall time, guard/valuation, signing, prepared journal, dispatch and exchange-response durations.
+Per-order evidence includes the complete validated winner/opposite snapshots, their source timestamps, proposal identity, maintained market context, applied policy, expected payout and signed cash.
+The receipt carries queue wait, database lookup, each OBer book request, parallel book wall time, guard/valuation, signing, prepared journal, dispatch and exchange-response durations.
 Dashboard records receipt ingestion time separately.
 The metrics endpoint reports stage percentiles over its bounded completed-sample window and explicitly reports truncation.
 Books remain in the durable order journal/history, while telemetry retains compact records to avoid multiplying snapshot memory by 2,048 samples.
@@ -76,7 +78,7 @@ The existing account readiness boolean still requires at least ten available cas
 
 Use `deploy/compose.uma.yaml` with `RUST_UMA_IMAGE` set to an immutable image digest, `RUST_UMA_ACCOUNT` set to the separately authorized account and `RUST_UMA_CREDENTIALS` pointing to its restricted credential file.
 The credential schema is the existing `LiveCredentials` structure; account name and signing/funding identity are checked before execution.
-Do not run the old `provision_live_credentials.py` unchanged for this lane: it is explicitly scoped to the original `airdrop_224` account.
+Reuse the existing protected `airdrop_224` credential rather than creating new exchange keys.
 The compose file requires the explicit `live` profile, joins the existing UMA and Polym data networks, exposes health only on host loopback port 18789, and uses its own persistent volume.
 It never recreates the original trader or UMA service.
 The dry-run compose file `deploy/compose.uma-dry.yaml` runs `shadow /app/uma-dry-run.json`, mounts only the read-only database credential, and uses `/api/shadow-orders/` for history.
@@ -117,7 +119,7 @@ Snapshot reads are always read-only, validate token/side identity, and never fal
 The snapshot label shows its capture time and the elapsed time from collection to submission.
 No second public request is added to the hot path, no duplicate snapshot table is introduced, and prior `rust_uma` orders work without backfill.
 
-## Connection reuse and query planning
+## Connection reuse and historical query measurements
 
 Database and public-book clients were already persistent before this optimization.
 The database pool now creates all configured connections, prepares the context and readiness statements, and executes an empty-key context read before accepting proposals.
@@ -125,8 +127,9 @@ Only these read-only sessions use `plan_cache_mode=force_generic_plan`, avoiding
 Query results are not cached: changed market state, settlements, fees and shutdown flags are read again on every proposal.
 `/metrics` exposes `database_pool` size, availability, waiting requests and configured maximum.
 
-The existing shared HTTP client explicitly enables HTTP/2 support and warms its public exchange connection with one bounded `/time` read at startup.
-The response body is fully drained so the pooled connection can be reused; an exchange warm-up failure logs a diagnostic and leaves the normal bounded book-fetch path available.
+The shared HTTP client now warms OBer with a bounded `/health` read at startup.
+The earlier public exchange `/time` warm-up and public orderbook reads have been removed.
+The response body is fully drained so the pooled connection can be reused; an OBer warm-up failure logs a diagnostic and leaves the normal bounded book-fetch path available.
 A successful warm-up logs the negotiated protocol.
 Both outcome books still use concurrent GET requests, the existing 90-second idle pool lifetime and normal reconnection behavior.
 No extra public request is added to each proposal, and no periodic external keepalive job is introduced.
