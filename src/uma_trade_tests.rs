@@ -46,10 +46,12 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     let book_peers = Arc::new(Mutex::new(Vec::new()));
     let (warm_capture, book_capture) = (warm_peer.clone(), book_peers.clone());
     let trusted = Arc::new(AtomicBool::new(true));
+    let changed = Arc::new(AtomicBool::new(false));
+    let changed_best = changed.clone();
     let (best_books, best_trusted) = (books.clone(), trusted.clone());
     let router = Router::new()
         .route("/book/{token}/best",get(move |axum::extract::Path(token):axum::extract::Path<String>| {
-            let (books,trusted)=(best_books.clone(),best_trusted.clone());
+            let (books,trusted,changed)=(best_books.clone(),best_trusted.clone(),changed_best.clone());
             async move {
                 if !trusted.load(Ordering::SeqCst) {return (StatusCode::NOT_FOUND,Json(json!({"error":"untrusted"})));}
                 let number=token.parse::<u64>().unwrap();
@@ -61,7 +63,8 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
                     if side=="bids" {rows.reverse();}
                     rows.into_iter().next()
                 };
-                let bid=best("bids");let ask=if number==400 {Some(json!({"price":"0.998","size":"10"}))} else {best("asks")};
+                let bid=best("bids");let mut ask=if number==400 {Some(json!({"price":"0.998","size":"10"}))} else {best("asks")};
+                if changed.load(Ordering::SeqCst) { ask=Some(json!({"price":"0.91","size":"20"})); }
                 (StatusCode::OK,Json(json!({"token_id":token,"market_id":if number<400 {"123".to_owned()}else{(number/2).to_string()},
                     "best_bid":bid.as_ref().map(|r|&r["price"]),"best_bid_size":bid.as_ref().map(|r|&r["size"]),
                     "best_ask":ask.as_ref().map(|r|&r["price"]),"best_ask_size":ask.as_ref().map(|r|&r["size"])})))
@@ -217,6 +220,14 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     app.receive_uma(event.clone(), Instant::now(), 1).await;
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 0);
     trusted.store(true, Ordering::SeqCst);
+    changed.store(true, Ordering::SeqCst);
+    app.receive_uma(event.clone(), Instant::now(), 1).await;
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        app.telemetry.snapshot(60)["reasons"]["ober_book_changed_during_read"],
+        1
+    );
+    changed.store(false, Ordering::SeqCst);
     let original_asks = books.read().await["42"]["asks"].clone();
     books.write().await["42"]["tick_size"] = json!("0.001");
     books.write().await["42"]["asks"] = json!([{"price":"0.999","size":"10"}]);

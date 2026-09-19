@@ -20,10 +20,6 @@ class TraderOnlyDeployTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 deploy.pin_uma_image(text, value)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
 class UmaModeDeployTests(unittest.TestCase):
     def test_live_requires_explicit_account_and_keeps_separate_journal(self):
         import json
@@ -66,3 +62,7 @@ class UmaModeDeployTests(unittest.TestCase):
         dry = json.loads((ROOT / "deploy/uma-dry-run.json").read_text())
         self.assertIsNone(live["total_budget_pusd"])
         self.assertNotEqual(live["journal"], dry["journal"])
+
+
+if __name__ == "__main__":
+    unittest.main()
