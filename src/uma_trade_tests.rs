@@ -30,10 +30,10 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
             "existing_order_count":0,"valuation":null,"resolution":null}]});
     let context = Arc::new(RwLock::new(page));
     let books = Arc::new(RwLock::new(json!({
-        "42":{"asset_id":"42","market":"0xabc","timestamp":now.to_string(),"tick_size":"0.01","min_order_size":"5","neg_risk":false,
+        "42":{"token_id":"42","market_id":"123","condition_id":"0xabc","timestamp":now*1000,"tick_size":"0.01","min_order_size":"5","neg_risk":false,
             "asks":[{"price":"0.99","size":"2"},{"price":"0.90","size":"20"}],
             "bids":[{"price":"0.80","size":"50"},{"price":"0.82","size":"100"}]},
-        "43":{"asset_id":"43","market":"0xabc","timestamp":now.to_string(),"tick_size":"0.01","min_order_size":"5","neg_risk":false,
+        "43":{"token_id":"43","market_id":"123","condition_id":"0xabc","timestamp":now*1000,"tick_size":"0.01","min_order_size":"5","neg_risk":false,
             "asks":[],"bids":[{"price":"0.10","size":"10"}]}
     })));
     let calls = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -45,9 +45,33 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     let warm_peer = Arc::new(Mutex::new(None));
     let book_peers = Arc::new(Mutex::new(Vec::new()));
     let (warm_capture, book_capture) = (warm_peer.clone(), book_peers.clone());
+    let trusted = Arc::new(AtomicBool::new(true));
+    let changed = Arc::new(AtomicBool::new(false));
+    let changed_best = changed.clone();
+    let (best_books, best_trusted) = (books.clone(), trusted.clone());
     let router = Router::new()
+        .route("/book/{token}/best",get(move |axum::extract::Path(token):axum::extract::Path<String>| {
+            let (books,trusted,changed)=(best_books.clone(),best_trusted.clone(),changed_best.clone());
+            async move {
+                if !trusted.load(Ordering::SeqCst) {return (StatusCode::NOT_FOUND,Json(json!({"error":"untrusted"})));}
+                let number=token.parse::<u64>().unwrap();
+                let source=books.read().await;
+                let b=&source[if number%2==0 {"42"} else {"43"}];
+                let best=|side:&str| {
+                    let mut rows=b[side].as_array().unwrap().clone();
+                    rows.sort_by_key(|r|crate::shadow_state::decimal(&r["price"]).unwrap());
+                    if side=="bids" {rows.reverse();}
+                    rows.into_iter().next()
+                };
+                let bid=best("bids");let mut ask=if number==400 {Some(json!({"price":"0.998","size":"10"}))} else {best("asks")};
+                if changed.load(Ordering::SeqCst) { ask=Some(json!({"price":"0.91","size":"20"})); }
+                (StatusCode::OK,Json(json!({"token_id":token,"market_id":if number<400 {"123".to_owned()}else{(number/2).to_string()},
+                    "best_bid":bid.as_ref().map(|r|&r["price"]),"best_bid_size":bid.as_ref().map(|r|&r["size"]),
+                    "best_ask":ask.as_ref().map(|r|&r["price"]),"best_ask_size":ask.as_ref().map(|r|&r["size"])})))
+            }
+        }))
         .route(
-            "/time",
+            "/health",
             get(
                 move |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
                     std::net::SocketAddr,
@@ -84,21 +108,22 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
             }),
         )
         .route(
-            "/book",
+            "/book/{token}",
             get(
-                move |Query(query): Query<HashMap<String, String>>,
+                move |axum::extract::Path(token): axum::extract::Path<String>,
                       axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
                     std::net::SocketAddr,
                 >| {
                     let (b, log, capture) = (b.clone(), book_log.clone(), book_capture.clone());
                     async move {
                         capture.lock().await.push(peer);
-                        let token = &query["token_id"];
                         log.lock().await.push(token.clone());
                         let number = token.parse::<u64>().unwrap();
                         let template = if number % 2 == 0 { "42" } else { "43" };
                         let mut book = b.read().await[template].clone();
-                        book["asset_id"] = json!(token);
+                        book["token_id"] = json!(token);
+                        book["market_id"] = json!(if number<400 {"123".to_owned()} else {(number/2).to_string()});
+                        if number==400 {book["asks"]=json!([{"price":"0.998","size":"10"}]);book["tick_size"]=json!("0.001");}
                         Json(book)
                     }
                 },
@@ -119,21 +144,28 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
         std::env::temp_dir().join(format!("rust-uma-test-{}-{now}.jsonl", std::process::id()));
     let journal = Journal::open(&path, &exchange.scope())?;
     let settings: Settings = serde_json::from_value(json!({
-        "django_url":format!("{url}/context"),"history_url":format!("{url}/history"),"ober_url":"http://unused",
+        "django_url":format!("{url}/context"),"history_url":format!("{url}/history"),"ober_url":url,
         "nats_url":"","redis_url":"","uma_url":"http://unused","bind":"127.0.0.1:0","journal":path,
         "max_signal_age_ms":5000,"max_inflight":8,"context_max_age_ms":90000,
         "max_order_budget_pusd":"30","total_budget_pusd":null,
         "order_sizing":serde_json::from_slice::<Value>(include_bytes!("../deploy/live.json"))?["order_sizing"],
-        "uma_trade":true,"clob_book_url":url
+        "uma_trade":true
     }))?;
     let app = Arc::new(App {
         control: Arc::default(),
         database: None,
-        live: None,
+        live: Some(LiveAccount {
+            name: "synthetic-account".into(),
+            id: 1,
+            signer: "synthetic-signer".into(),
+            funder: "synthetic-funder".into(),
+            token: "synthetic-access".into(),
+        }),
         history_notify: Notify::new(),
         settings,
         data: RwLock::new(Data {
             history_ready_at_ms: now,
+            live_ready_at_ms: now,
             native_uma_at_ms: now,
             native_uma_health: json!({"ready":true}),
             ..Data::default()
@@ -153,6 +185,7 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
         http: reqwest::Client::new(),
     });
     app.warm_book_connection().await?;
+    app.control.confirm_snapshot(&serde_json::to_vec(&json!({"schema_version":1,"source":"dashboard","dry_run_enabled":false,"triggered_at_ms":now_ms()}))?)?;
     let event = crate::uma::Event {
         channel: "uma:resolution".into(),
         market_id: "123".into(),
@@ -183,6 +216,26 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
         1
     );
     context.write().await["results"] = rows;
+    trusted.store(false, Ordering::SeqCst);
+    app.receive_uma(event.clone(), Instant::now(), 1).await;
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 0);
+    trusted.store(true, Ordering::SeqCst);
+    changed.store(true, Ordering::SeqCst);
+    app.receive_uma(event.clone(), Instant::now(), 1).await;
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        app.telemetry.snapshot(60)["reasons"]["ober_book_changed_during_read"],
+        1
+    );
+    changed.store(false, Ordering::SeqCst);
+    let original_asks = books.read().await["42"]["asks"].clone();
+    books.write().await["42"]["tick_size"] = json!("0.001");
+    books.write().await["42"]["asks"] = json!([{"price":"0.999","size":"10"}]);
+    app.receive_uma(event.clone(), Instant::now(), 1).await;
+    assert_eq!(mock.state.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(app.telemetry.snapshot(60)["reasons"]["max_ask_price"], 1);
+    books.write().await["42"]["asks"] = original_asks;
+
     // Empty winner asks also stop before signing.
     let asks = books.write().await["42"]["asks"].take();
     books.write().await["42"]["asks"] = json!([]);
@@ -203,7 +256,7 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     context.write().await["config"]["ev_threshold"] = json!("0.0002");
     app.receive_uma(event.clone(), Instant::now(), 1).await;
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
-    let id = uma_trade::signal_id(&event, false);
+    let id = uma_trade::signal_id(&event, true);
     let entry = app.journal.lock().await.get(&id)?.unwrap();
     assert_eq!(entry.reply.state, "accepted");
     assert_eq!(entry.reply.submitted_amount, Some("9.90".parse()?));
@@ -213,6 +266,7 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
         std::fs::write(path, serde_json::to_vec_pretty(&body)?)?;
     }
     assert_eq!(body["input_kind"], "uma_propose");
+    assert_eq!(body["uma"]["book_source"], "ober");
     assert_eq!(body["market_id"], "123");
     assert_eq!(body["uma"]["winner_book"]["asks"][0]["price"], "0.90");
     assert!(body["uma"]["django_ms"].as_f64().unwrap() >= 10.0);
@@ -222,8 +276,8 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     let mut duplicate = event.clone();
     duplicate.received_at_ms += 1;
     assert_eq!(
-        uma_trade::signal_id(&event, false),
-        uma_trade::signal_id(&duplicate, false)
+        uma_trade::signal_id(&event, true),
+        uma_trade::signal_id(&duplicate, true)
     );
     app.receive_uma(duplicate, Instant::now(), 1).await;
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 1);
@@ -259,6 +313,9 @@ async fn proposal_reads_context_books_and_uses_live_sizing() -> Result<()> {
     })
     .await?;
     assert_eq!(mock.state.posts.load(Ordering::SeqCst), 9);
+    let orders = app.journal.lock().await.pending_batch(true)?;
+    assert!(orders.iter().all(|o| o.signal.ask <= uma_trade::MAX_PRICE));
+    assert!(orders.iter().any(|o| o.signal.ask == uma_trade::MAX_PRICE));
     assert!(peak.load(Ordering::SeqCst) > 1);
     assert!(peak.load(Ordering::SeqCst) <= 8);
     let metrics = app.telemetry.snapshot(60);

@@ -5,7 +5,7 @@
   "nats_url": "nats://nats:4222",
   "redis_url": "redis://redis:6379/0",
   "bind": "0.0.0.0:8787",
-  "journal": "/app/data/rust-uma-orders.jsonl",
+  "journal": "/app/data/rust-uma-live-airdrop-224.jsonl",
   "max_signal_age_ms": 2000,
   "max_inflight": 8,
   "context_max_age_ms": 90000,
@@ -13,12 +13,12 @@
   "total_budget_pusd": null,
   "uma_url": "http://uma:8788",
   "uma_trade": true,
-  "clob_book_url": "https://clob.polymarket.com",
   "order_sizing": {
     "standard": "5.00",
     "below_005": "5.00",
     "below_080": "20.00",
     "at_099_low_depth": "20.00",
     "through_098": "10.00"
-  }
+  },
+  "database_config": "/run/secrets/database_reader"
 }

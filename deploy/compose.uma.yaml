@@ -4,13 +4,13 @@ services:
   trader-uma:
     profiles: [live]
     image: ${RUST_UMA_IMAGE:?set immutable Rust image digest}
-    command: [trade-live, /app/uma-trader.json, /run/secrets/uma_trader_credentials, "${RUST_UMA_ACCOUNT:?set the independent account name}"]
+    command: [trade-live, /app/uma-trader.json, /run/secrets/uma_trader_credentials, "${RUST_UMA_ACCOUNT:?set the authorized account name}"]
     networks: [shared-uma, polym-data]
     environment:
       TOKIO_WORKER_THREADS: "2"
     ports: ["127.0.0.1:18789:8787"]
     volumes: [uma-order-data:/app/data]
-    secrets: [uma_trader_credentials]
+    secrets: [uma_trader_credentials, database_reader]
     read_only: true
     tmpfs: ["/tmp:size=16m,mode=1777"]
     cap_drop: [ALL]
@@ -40,5 +40,7 @@ networks:
     external: true
     name: polym_amster_polym
 secrets:
+  database_reader:
+    file: /opt/polym-rust-uma/secrets/database-reader.json
   uma_trader_credentials:
-    file: ${RUST_UMA_CREDENTIALS:?set the independent account credential file}
+    file: ${RUST_UMA_CREDENTIALS:?set the authorized account credential file}

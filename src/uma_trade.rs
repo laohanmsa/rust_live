@@ -1,10 +1,8 @@
-//! Proposal-triggered lane. Shared UMA lifecycle, on-demand Django context and public books.
+//! Proposal-triggered lane. Shared UMA lifecycle, direct database context and trusted OBer books.
 use super::*;
 use crate::shadow_state::decimal;
 
-pub(super) fn book_url() -> String {
-    "https://clob.polymarket.com".into()
-}
+pub(super) const MAX_PRICE: Decimal = Decimal::from_parts(998, 0, 0, false, 3);
 
 pub(super) fn signal_id(event: &crate::uma::Event, live: bool) -> String {
     let identity = format!(
@@ -54,8 +52,8 @@ impl App {
         let mut response = self
             .http
             .get(format!(
-                "{}/time",
-                self.settings.clob_book_url.trim_end_matches('/')
+                "{}/health",
+                self.settings.ober_url.trim_end_matches('/')
             ))
             .timeout(Duration::from_secs(2))
             .send()
@@ -65,11 +63,11 @@ impl App {
         let mut bytes = 0;
         while let Some(chunk) = response.chunk().await? {
             bytes += chunk.len();
-            ensure!(bytes <= 1024, "oversized exchange time response");
+            ensure!(bytes <= 64 * 1024, "oversized OBer health response");
         }
         println!(
             "{}",
-            json!({"event":"book_connection_warmed","http_version":format!("{version:?}"),"elapsed_ms":elapsed_ms(started)})
+            json!({"event":"ober_connection_warmed","http_version":format!("{version:?}"),"elapsed_ms":elapsed_ms(started)})
         );
         Ok(())
     }
@@ -218,35 +216,82 @@ impl App {
         }
     }
 
-    async fn uma_book(&self, token: &str) -> Result<(Value, f64), &'static str> {
+    async fn uma_book(&self, token: &str, market: &str) -> Result<(Value, f64), &'static str> {
+        if token.is_empty() || token.len() > 78 || !token.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("invalid_token_id");
+        }
         let started = Instant::now();
+        let url = format!(
+            "{}/book/{token}",
+            self.settings.ober_url.trim_end_matches('/')
+        );
         let mut response = self
             .http
-            .get(format!(
-                "{}/book",
-                self.settings.clob_book_url.trim_end_matches('/')
-            ))
-            .query(&[("token_id", token)])
+            .get(&url)
             .send()
             .await
-            .map_err(|_| "orderbook_request_failed")?
+            .map_err(|_| "ober_book_unavailable")?
             .error_for_status()
-            .map_err(|_| "orderbook_http_error")?;
+            .map_err(|_| "ober_book_http_error")?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| "orderbook_read_failed")?
+            .map_err(|_| "ober_book_read_failed")?
         {
             if bytes.len() + chunk.len() > 512 * 1024 {
                 return Err("orderbook_too_large");
             }
             bytes.extend_from_slice(&chunk);
         }
-        let book = normalize_book(
-            serde_json::from_slice(&bytes).map_err(|_| "invalid_orderbook_json")?,
-            token,
-        )?;
+        let mut book: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_ober_book")?;
+        if book["token_id"].as_str() != Some(token) || book["market_id"].as_str() != Some(market) {
+            return Err("ober_market_or_token_mismatch");
+        }
+        // Retain native identity/clock and add the existing receipt aliases.
+        book["asset_id"] = book["token_id"].clone();
+        book["market"] = book["condition_id"].clone();
+        book["ober_timestamp"] = book["timestamp"].clone();
+        book["timestamp"] = json!(
+            event_ms(&book["timestamp"])
+                .filter(|t| *t > 0)
+                .ok_or("invalid_ober_timestamp")?
+        );
+        let book = normalize_book(book, token)?;
+        // Full books include diagnostic/quarantined data. Best reads enforce OBer's trust gate.
+        let trusted: Value = self
+            .http
+            .get(format!("{url}/best"))
+            .send()
+            .await
+            .map_err(|_| "ober_trust_check_failed")?
+            .error_for_status()
+            .map_err(|_| "ober_untrusted_book")?
+            .json()
+            .await
+            .map_err(|_| "invalid_ober_best")?;
+        if trusted["token_id"].as_str() != Some(token)
+            || trusted["market_id"].as_str() != Some(market)
+        {
+            return Err("ober_market_or_token_mismatch");
+        }
+        for (side, price, size) in [
+            ("bids", "best_bid", "best_bid_size"),
+            ("asks", "best_ask", "best_ask_size"),
+        ] {
+            let level = book[side].as_array().and_then(|rows| rows.first());
+            if level.and_then(|r| decimal(&r["price"])) != decimal(&trusted[price])
+                || level.and_then(|r| decimal(&r["size"])) != decimal(&trusted[size])
+            {
+                return Err("ober_book_changed_during_read");
+            }
+        }
+        if let (Some(bid), Some(ask)) =
+            (decimal(&trusted["best_bid"]), decimal(&trusted["best_ask"]))
+            && bid >= ask
+        {
+            return Err("crossed_orderbook");
+        }
         Ok((book, elapsed_ms(started)))
     }
 
@@ -290,6 +335,8 @@ impl App {
             })?;
         let mut policy = policy.ok_or("missing_strategy_config")?;
         policy.order_sizing = self.settings.order_sizing.clone();
+        policy.max_ask_price = policy.max_ask_price.min(MAX_PRICE);
+        evidence["book_source"] = json!("ober");
         let (winner, loser) = if event.proposed_price == "1" {
             (&context.token_id_yes, &context.token_id_no)
         } else {
@@ -299,8 +346,10 @@ impl App {
         let loser = loser.clone().ok_or("missing_loser_token")?;
         let started = Instant::now();
         // M5 needs the opposite outcome's bid. These independent reads share one client pool.
-        let (winner_result, loser_result) =
-            tokio::join!(self.uma_book(&winner), self.uma_book(&loser));
+        let (winner_result, loser_result) = tokio::join!(
+            self.uma_book(&winner, &event.market_id),
+            self.uma_book(&loser, &event.market_id)
+        );
         evidence["book_ms"] = json!(elapsed_ms(started));
         let (winner_book, winner_ms) = winner_result?;
         evidence["winner_book_ms"] = json!(winner_ms);
@@ -312,16 +361,9 @@ impl App {
         if winner_book["asks"].as_array().is_none_or(Vec::is_empty) {
             return Err("missing_winner_ask");
         }
-        if winner_book["neg_risk"].as_bool() != Some(context.neg_risk)
-            || loser_book["neg_risk"].as_bool() != Some(context.neg_risk)
-            || winner_book["market"] != loser_book["market"]
-        {
+        if winner_book["market"] != loser_book["market"] {
             return Err("orderbook_market_rules_mismatch");
         }
-        let min_size = decimal(&winner_book["min_order_size"])
-            .filter(|n| *n > Decimal::ZERO)
-            .ok_or("missing_market_rules")?;
-        context.min_order_size = context.min_order_size.max(min_size);
         let asks = winner_book["asks"].as_array().ok_or("invalid_orderbook")?;
         let bids = winner_book["bids"].as_array().ok_or("invalid_orderbook")?;
         let book = json!({"market_id":event.market_id,"token_id":winner,"timestamp":now_ms()*1000,
