@@ -46,7 +46,7 @@ A recovered journal restores market quotas and prevents resubmission of an alrea
 ## Observation
 
 Per-order evidence includes the complete validated winner/opposite snapshots, their exchange timestamps, proposal identity, maintained market context, applied policy, expected payout and signed cash.
-The receipt carries queue wait, Django lookup, each public book request, parallel book wall time, guard/valuation, signing, prepared journal, dispatch and exchange-response durations.
+The receipt carries queue wait, Django lookup, each OBer book request, parallel book wall time, guard/valuation, signing, prepared journal, dispatch and exchange-response durations.
 Dashboard records receipt ingestion time separately.
 The metrics endpoint reports stage percentiles over its bounded completed-sample window and explicitly reports truncation.
 Books remain in the durable order journal/history, while telemetry retains compact records to avoid multiplying snapshot memory by 2,048 samples.
@@ -110,7 +110,7 @@ It covers absent markets, market/token mapping, policy, normalized and named fee
 
 ## Order-time book display
 
-The two complete public order books used for the decision are persisted in the existing prepared-order journal and exported with the order receipt.
+The two complete OBer order books used for the decision are persisted in the existing prepared-order journal and exported with the order receipt.
 Dashboard now renders the current book beside the saved order book using its existing orderbook component.
 `/airdrop/orderbook/<token>/?order_snapshot_id=<order>&book_side=winner` reads only that order's immutable receipt; `book_side=loser` selects the opposite outcome.
 Snapshot reads are always read-only, validate token/side identity, and never fall back to a live book.
@@ -144,3 +144,33 @@ Because batch requests did not improve the tail in that sample, the existing par
 Long idle periods or peer disconnects can still require a new transport connection.
 
 Tests verify that startup warming creates all pool sessions, later concurrent queries retain the same backend IDs, generic plans still see changed rows, and a book request reuses the connection opened by the time request.
+
+## OBer source and authorized live account (2026-09-19)
+
+The UMA lane now reads `GET /book/<token>` from its configured OBer service, with no Polymarket orderbook REST request or fallback.
+It fetches both complete sides concurrently and then checks `/book/<token>/best` for each outcome.
+The full endpoint is diagnostic and may expose quarantined data; the best endpoint enforces the existing trust gate.
+A failed trust check, mismatched identity, changed top price/size or crossed book aborts the attempt.
+No OBer service code or runtime restart is needed.
+On a cache miss, OBer's existing endpoint behavior may subscribe the token and return an empty book; the trader skips that incomplete response.
+
+Both full snapshots remain in the order receipt.
+Native OBer token/market identity and original `ober_timestamp` are retained, with compatible `asset_id`/`market` aliases and a normalized millisecond timestamp for history rendering.
+Minimum size and negative-risk metadata come from the maintained database context; the quoted tick comes from OBer when available.
+The receipt reports `book_source=ober`, and its book timing includes the trust check.
+
+The UMA-specific price ceiling is 0.998, applied as the minimum of that limit and the maintained strategy limit, with a second check before submission.
+Other Rust live strategies retain their existing price limit.
+The existing fee-aware sizing bands are unchanged.
+
+The authorized live account is `airdrop_224`.
+`python3 scripts/deploy_uma_dry.py --live-account airdrop_224` explicitly selects the live compose profile; omitting the argument still selects shadow mode.
+The process reuses the existing protected account credential on amster-p and the existing read-only database credential.
+The original Rust live and shared UMA containers are not recreated.
+The live journal is `/app/data/rust-uma-live-airdrop-224.jsonl`, separate from the retained shadow journal.
+No cash reservation or shared cash-allocation service is introduced, and `total_budget_pusd` remains null.
+The journal's historical budget counter is audit data, not a cash hold.
+Market-attempt deduplication, per-market limits, account readiness, current main's unknown-order reconciliation, tennis totals restriction and global dry-run controls remain active.
+Do not disable the global dry-run switch automatically if it blocks activation.
+
+The live-path test uses a synthetic account and a loopback exchange, checks 0.999 rejection and 0.998 acceptance, and covers untrusted OBer books without sending a real order.

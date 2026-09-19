@@ -73,8 +73,6 @@ pub struct Settings {
     pub uma_trade: bool,
     #[serde(default)]
     pub database_config: Option<String>,
-    #[serde(default = "uma_trade::book_url")]
-    pub clob_book_url: String,
     pub django_url: String,
     pub history_url: String,
     pub ober_url: String,
@@ -1068,6 +1066,7 @@ impl App {
         let valid = {
             let data = self.data.read().await;
             self.ready(&data)
+                && (!self.settings.uma_trade || signal.ask <= uma_trade::MAX_PRICE)
                 && r.uma.as_ref().is_none_or(|v| {
                     v["feed_epoch"].as_u64() == Some(self.redis_epoch.load(Ordering::SeqCst))
                         && data
@@ -1159,7 +1158,7 @@ struct Window {
 async fn health(State(app): State<Arc<App>>) -> Json<Value> {
     let data = app.data.read().await;
     Json(
-        json!({"mode":app.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"stop_reason":*app.stop_reason.lock().expect("stop reason mutex"),"data_sources":if app.settings.uma_trade {"Django + shared UMA + Polymarket books"} else {"Django + UMA + OBer"},"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
+        json!({"mode":app.mode(),"account":app.live.as_ref().map(|a|&a.name),"ready":app.ready(&data),"stopped":app.stopped.load(Ordering::SeqCst),"stop_reason":*app.stop_reason.lock().expect("stop reason mutex"),"data_sources":if app.settings.uma_trade {"PostgreSQL + shared UMA + OBer"} else {"Django + UMA + OBer"},"execution":if app.live.is_some(){"clob_direct"}else{"loopback_mock_only"}}),
     )
 }
 async fn metrics(
@@ -1198,6 +1197,7 @@ async fn metrics(
     });
     result["order_sizing"] = json!(app.settings.order_sizing);
     result["max_order_budget_pusd"] = json!(app.settings.max_order_budget_pusd);
+    result["uma_max_ask_price"] = json!(app.settings.uma_trade.then_some(uma_trade::MAX_PRICE));
     result["sources"] = json!({"nats_connected":app.nats_up.load(Ordering::SeqCst),"uma_connected":app.redis_up.load(Ordering::SeqCst),"uma_epoch":app.redis_epoch.load(Ordering::SeqCst),"synced_epoch":data.synced_epoch,"context_markets":data.markets.len(),"eligible_markets":data.markets.values().filter(|c|c.eligible&&!data.lifecycle.has_dispute(&c.market_id)&&c.resolution.as_ref().is_some_and(|r|data.lifecycle.is_proposed(&c.market_id,r.request_id.as_deref().unwrap_or(""),r.block_number.unwrap_or(0)))).count(),"valuation_mode":"local_m5","valuation_inputs":data.markets.values().filter(|c|c.market_volume.is_some()&&c.event_volume.is_some()).count(),"pending_context":data.lifecycle.needs_refresh.len(),"context_age_ms":now_ms().saturating_sub(data.last_sync_ms),"context_error":data.context_error,"uma_counts":data.uma_counts,"last_uma_ms":data.last_uma_ms,"last_ober_ms":data.last_ober_ms,"timestamp_kinds":data.clocks,"recent_mock_orders":data.decisions});
     if app.settings.uma_trade {
         result["sources"]["nats_connected"] = json!(app.redis_up.load(Ordering::SeqCst));
@@ -1528,7 +1528,6 @@ mod tests {
                 settings: Settings {
                     uma_trade: false,
                     database_config: None,
-                    clob_book_url: uma_trade::book_url(),
                     django_url: format!("{url}/context"),
                     history_url: format!("{url}/history"),
                     ober_url: url,

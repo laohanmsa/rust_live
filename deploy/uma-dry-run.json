@@ -13,7 +13,6 @@
   "total_budget_pusd": null,
   "uma_url": "http://uma:8788",
   "uma_trade": true,
-  "clob_book_url": "https://clob.polymarket.com",
   "database_config": "/run/secrets/database_reader",
   "order_sizing": {
     "standard": "5.00",
